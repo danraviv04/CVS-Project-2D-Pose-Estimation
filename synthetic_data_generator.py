@@ -4,7 +4,7 @@ import os
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num_images", type=int, default=10, help="Number of synthetic images to generate.")
+    parser.add_argument("--num_images", type=int, default=100, help="Number of synthetic images to generate.")
     parser.add_argument("--output_dir", type=str, default="/home/student/project/output", help="Output directory for generated and composited images.")
     parser.add_argument("--backgrounds_dir", type=str, default="/datashare/project/train2017", help="Directory with background images.")
     args = parser.parse_args()
@@ -14,7 +14,7 @@ def main():
     # Step 1: Generate transparent tool renderings
     print("🛠️ Generating transparent tool renderings...")
     subprocess.run([
-        "blenderproc", "run", "generate_tools.py",
+        "blenderproc", "run", "data_generation/generate_tools.py",
         "--obj_dir", "/datashare/project/surgical_tools_models",
         "--camera_params", "/datashare/project/camera.json",
         "--output_dir", args.output_dir,
@@ -24,7 +24,7 @@ def main():
     # Step 2: Paste those onto random backgrounds
     print("🖼️ Pasting tools onto random backgrounds...")
     subprocess.run([
-        "python3", "paste_on_random_background.py",
+        "python3", "data_generation/paste_on_random_background.py",
         "-i", images_dir,
         "-b", args.backgrounds_dir,
         "-o", os.path.join(args.output_dir, "composited")

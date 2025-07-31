@@ -12,131 +12,6 @@ from bpy_extras.object_utils import world_to_camera_view
 from sklearn.cluster import KMeans
 from matplotlib import pyplot as plt
 
-# def get_tool_keypoints_local(tool_name, obj):
-#     base = os.path.basename(tool_name).lower()
-
-#     mesh = obj.get_mesh()
-#     vertices = np.array([v.co[:] for v in mesh.vertices])
-#     mean = np.mean(vertices, axis=0)
-#     centered = vertices - mean
-#     cov = np.cov(centered.T)
-#     eigvals, eigvecs = np.linalg.eigh(cov)
-#     order = np.argsort(eigvals)[::-1]
-#     major, minor1, minor2 = eigvecs[:, order].T
-
-#     # Axis indices
-#     forward_axis = 0  # major
-#     side_axis = 2     # minor2
-
-#     local_vertices = centered @ eigvecs
-
-#     if base.startswith("t") and not base.startswith("nh"):
-#         print(f"📌 Using refined tweezer layout for: {tool_name}")
-
-#         prong_coords = local_vertices[:, side_axis].reshape(-1, 1)
-#         kmeans = KMeans(n_clusters=2, n_init=5, random_state=0).fit(prong_coords)
-#         labels = kmeans.labels_
-
-#         prong_0 = vertices[labels == 0]
-#         prong_1 = vertices[labels == 1]
-#         if np.mean(local_vertices[labels == 0, side_axis]) > np.mean(local_vertices[labels == 1, side_axis]):
-#             left_prong, right_prong = prong_0, prong_1
-#         else:
-#             left_prong, right_prong = prong_1, prong_0
-
-#         local_left = (left_prong - mean) @ eigvecs
-#         local_right = (right_prong - mean) @ eigvecs
-
-#         tip_left = left_prong[np.argmax(local_left[:, forward_axis])]
-#         tip_right = right_prong[np.argmax(local_right[:, forward_axis])]
-
-#         # Avoid overlapping tips
-#         if np.linalg.norm(tip_left - tip_right) < 0.005:
-#             print(f"⚠️ {tool_name}: tips too close, nudging right tip")
-#             tip_right += minor2 * 0.002
-
-#         # Stem = 25% forward
-#         stem_left = left_prong[np.argmin(np.abs(local_left[:, forward_axis] - 0.25 * np.max(local_left[:, forward_axis])))]
-#         stem_right = right_prong[np.argmin(np.abs(local_right[:, forward_axis] - 0.25 * np.max(local_right[:, forward_axis])))]
-
-#         # Base = rear center
-#         base_pt = mean - major * 0.5 * (np.max(centered @ major) - np.min(centered @ major))
-
-#         return {
-#             "tip_left": list(tip_left),
-#             "tip_right": list(tip_right),
-#             "stem_left": list(stem_left),
-#             "stem_right": list(stem_right),
-#             "base": list(base_pt),
-#         }
-
-#     elif "nh" in base:
-#         print(f"📌 Using robust needle holder layout for: {tool_name}")
-
-#         side_coords = local_vertices[:, side_axis].reshape(-1, 1)
-#         kmeans = KMeans(n_clusters=2, n_init=5, random_state=0).fit(side_coords)
-#         labels = kmeans.labels_
-
-#         jaw_0 = vertices[labels == 0]
-#         jaw_1 = vertices[labels == 1]
-#         if np.mean(local_vertices[labels == 0, side_axis]) > np.mean(local_vertices[labels == 1, side_axis]):
-#             left_jaw, right_jaw = jaw_0, jaw_1
-#         else:
-#             left_jaw, right_jaw = jaw_1, jaw_0
-
-#         # Compute shaft first (center of jaw)
-#         shaft_left = left_jaw[np.argmin(np.abs((left_jaw - mean) @ major))]
-#         shaft_right = right_jaw[np.argmin(np.abs((right_jaw - mean) @ major))]
-
-#         # Tips = farthest along major, far from shaft
-#         left_proj = (left_jaw - mean) @ major
-#         right_proj = (right_jaw - mean) @ major
-
-#         tip_left = None
-#         for pt in left_jaw[np.argsort(left_proj)[::-1]]:
-#             if np.linalg.norm(pt - shaft_left) > 0.01:
-#                 tip_left = pt
-#                 break
-#         if tip_left is None:
-#             tip_left = left_jaw[np.argmax(left_proj)]
-#             print(f"⚠️ {tool_name}: tip_left fallback used")
-
-#         tip_right = None
-#         for pt in right_jaw[np.argsort(right_proj)[::-1]]:
-#             if np.linalg.norm(pt - shaft_right) > 0.01:
-#                 tip_right = pt
-#                 break
-#         if tip_right is None:
-#             tip_right = right_jaw[np.argmax(right_proj)]
-#             print(f"⚠️ {tool_name}: tip_right fallback used")
-
-#         # Avoid overlapping tips
-#         if np.allclose(tip_left, tip_right):
-#             print(f"⚠️ {tool_name}: needle tips are overlapping, nudging right tip")
-#             tip_right += minor2 * 0.002
-
-#         # Rings = farthest from center
-#         ring_left = left_jaw[np.argmax(np.linalg.norm(left_jaw - mean, axis=1))]
-#         ring_right = right_jaw[np.argmax(np.linalg.norm(right_jaw - mean, axis=1))]
-
-#         return {
-#             "tip_left": list(tip_left),
-#             "tip_right": list(tip_right),
-#             "shaft_left": list(shaft_left),
-#             "shaft_right": list(shaft_right),
-#             "ring_left": list(ring_left),
-#             "ring_right": list(ring_right),
-#         }
-
-#     else:
-#         print(f"⚠️ Fallback to corners for: {tool_name}")
-#         return {f"corner_{i}": coord for i, coord in enumerate(obj.get_bound_box())}
-
-import os
-import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.cluster import KMeans
-
 def get_left_right_split_labels(centered_vertices: np.ndarray):
     # Use PCA to find principal directions
     cov = np.cov(centered_vertices.T)
@@ -151,22 +26,21 @@ def get_left_right_split_labels(centered_vertices: np.ndarray):
 
     return labels, left_right_axis, eigvecs
 
-
-def plot_split_debug(title, local_vertices, labels, eigvecs, output_dir, tool_name):
-    fig = plt.figure(figsize=(5, 5))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(local_vertices[:, 0], local_vertices[:, 1], local_vertices[:, 2],
-               c=labels, cmap='coolwarm', s=1)
-    origin = np.zeros(3)
-    for i, vec in enumerate(eigvecs.T):
-        ax.quiver(*origin, *vec, color=['r', 'g', 'b'][i], linewidth=2, label=f"PC{i}")
-    ax.set_title(title)
-    ax.legend()
-    ax.view_init(elev=30, azim=30)
-    os.makedirs(os.path.join(output_dir, "debug_split"), exist_ok=True)
-    filename = os.path.join(output_dir, "debug_split", f"{tool_name}_{title.replace(' ', '_')}.png")
-    plt.savefig(filename, dpi=150)
-    plt.close()
+# def plot_split_debug(title, local_vertices, labels, eigvecs, output_dir, tool_name):
+#     fig = plt.figure(figsize=(5, 5))
+#     ax = fig.add_subplot(111, projection='3d')
+#     ax.scatter(local_vertices[:, 0], local_vertices[:, 1], local_vertices[:, 2],
+#                c=labels, cmap='coolwarm', s=1)
+#     origin = np.zeros(3)
+#     for i, vec in enumerate(eigvecs.T):
+#         ax.quiver(*origin, *vec, color=['r', 'g', 'b'][i], linewidth=2, label=f"PC{i}")
+#     ax.set_title(title)
+#     ax.legend()
+#     ax.view_init(elev=30, azim=30)
+#     os.makedirs(os.path.join(output_dir, "debug_split"), exist_ok=True)
+#     filename = os.path.join(output_dir, "debug_split", f"{tool_name}_{title.replace(' ', '_')}.png")
+#     plt.savefig(filename, dpi=150)
+#     plt.close()
 
 def get_tool_keypoints_local(tool_name, obj):
     base = os.path.basename(tool_name).lower()
@@ -178,7 +52,7 @@ def get_tool_keypoints_local(tool_name, obj):
     # Left-right split
     labels, split_axis, eigvecs = get_left_right_split_labels(centered)
     local_vertices = centered @ eigvecs
-    plot_split_debug("Left-Right Split", local_vertices, labels, eigvecs, "", os.path.basename(tool_name))
+    #plot_split_debug("Left-Right Split", local_vertices, labels, eigvecs, "", os.path.basename(tool_name))
 
     part_0 = vertices[labels == 0]
     part_1 = vertices[labels == 1]
