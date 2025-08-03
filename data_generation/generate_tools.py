@@ -12,120 +12,109 @@ from bpy_extras.object_utils import world_to_camera_view
 from sklearn.cluster import KMeans
 from matplotlib import pyplot as plt
 
+# def get_left_right_split_labels(centered_vertices: np.ndarray):
+#     # Use PCA to find principal directions
+#     cov = np.cov(centered_vertices.T)
+#     eigvals, eigvecs = np.linalg.eigh(cov)
+#     order = np.argsort(eigvals)[::-1]
+#     eigvecs = eigvecs[:, order]  # columns: [PC0, PC1, PC2]
+
+#     # PC1 is usually the left/right axis (symmetry axis)
+#     left_right_axis = eigvecs[:, 1]
+#     projections = centered_vertices @ left_right_axis
+#     labels = (projections > 0).astype(int)
+
+#     return labels, left_right_axis, eigvecs
+
 def get_left_right_split_labels(centered_vertices: np.ndarray):
-    # Use PCA to find principal directions
     cov = np.cov(centered_vertices.T)
     eigvals, eigvecs = np.linalg.eigh(cov)
-    order = np.argsort(eigvals)[::-1]
-    eigvecs = eigvecs[:, order]  # columns: [PC0, PC1, PC2]
-
-    # PC1 is usually the left/right axis (symmetry axis)
-    left_right_axis = eigvecs[:, 1]
-    projections = centered_vertices @ left_right_axis
+    eigvecs = eigvecs[:, np.argsort(eigvals)[::-1]]
+    split_axis = eigvecs[:, 1]  # consistent axis
+    projections = centered_vertices @ split_axis
     labels = (projections > 0).astype(int)
+    return labels, split_axis, eigvecs
 
-    return labels, left_right_axis, eigvecs
+def plot_split_debug(title, local_vertices, labels, eigvecs, output_dir, tool_name, frame_idx=None):
+    fig = plt.figure(figsize=(5, 5))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter(local_vertices[:, 0], local_vertices[:, 1], local_vertices[:, 2],
+               c=labels, cmap='coolwarm', s=1)
+    origin = np.zeros(3)
+    for i, vec in enumerate(eigvecs.T):
+        ax.quiver(*origin, *vec, color=['r', 'g', 'b'][i], linewidth=2, label=f"PC{i}")
+    ax.set_title(title)
+    ax.legend()
+    ax.view_init(elev=30, azim=30)
 
-# def plot_split_debug(title, local_vertices, labels, eigvecs, output_dir, tool_name):
-#     fig = plt.figure(figsize=(5, 5))
-#     ax = fig.add_subplot(111, projection='3d')
-#     ax.scatter(local_vertices[:, 0], local_vertices[:, 1], local_vertices[:, 2],
-#                c=labels, cmap='coolwarm', s=1)
-#     origin = np.zeros(3)
-#     for i, vec in enumerate(eigvecs.T):
-#         ax.quiver(*origin, *vec, color=['r', 'g', 'b'][i], linewidth=2, label=f"PC{i}")
-#     ax.set_title(title)
-#     ax.legend()
-#     ax.view_init(elev=30, azim=30)
-#     os.makedirs(os.path.join(output_dir, "debug_split"), exist_ok=True)
-#     filename = os.path.join(output_dir, "debug_split", f"{tool_name}_{title.replace(' ', '_')}.png")
-#     plt.savefig(filename, dpi=150)
-#     plt.close()
+    os.makedirs(os.path.join(output_dir, "debug_split"), exist_ok=True)
 
-def get_tool_keypoints_local(tool_name, obj):
+    # Build filename with tool name and frame index
+    frame_str = f"_frame{frame_idx:06d}" if frame_idx is not None else ""
+    filename = os.path.join(output_dir, "debug_split",
+                            f"{os.path.splitext(tool_name)[0]}{frame_str}_{title.replace(' ', '_')}.png")
+    plt.savefig(filename, dpi=150)
+    plt.close()
+
+
+def get_tool_keypoints_local(tool_name, obj, frame_idx):
     base = os.path.basename(tool_name).lower()
     mesh = obj.get_mesh()
     vertices = np.array([v.co[:] for v in mesh.vertices])
     mean = np.mean(vertices, axis=0)
     centered = vertices - mean
-
-    # Left-right split
     labels, split_axis, eigvecs = get_left_right_split_labels(centered)
     local_vertices = centered @ eigvecs
-    #plot_split_debug("Left-Right Split", local_vertices, labels, eigvecs, "", os.path.basename(tool_name))
+    
+    plot_split_debug("Left-Right Split", local_vertices, labels, eigvecs, "", os.path.basename(tool_name), frame_idx)
 
-    part_0 = vertices[labels == 0]
-    part_1 = vertices[labels == 1]
-
-    if np.mean((part_0 - mean) @ split_axis) > np.mean((part_1 - mean) @ split_axis):
-        right, left = part_0, part_1
-    else:
-        right, left = part_1, part_0
+    projections = (vertices - mean) @ split_axis
+    left = vertices[projections < 0]
+    right = vertices[projections >= 0]
 
     local_right = (right - mean) @ eigvecs
     local_left = (left - mean) @ eigvecs
 
-    major = eigvecs[:, 0]  # PC0 = longest axis
+    major = eigvecs[:, 0]  # always use PC0 for major axis
 
     if "nh" in base:
-        print(f"📌 Needle Holder layout (left-right split): {tool_name}")
-
         shaft_right = right[np.argmin(np.abs((right - mean) @ major))]
         shaft_left = left[np.argmin(np.abs((left - mean) @ major))]
 
         def find_tip(jaw, shaft):
             projections = (jaw - mean) @ major
-            for pt in jaw[np.argsort(projections)[::-1]]:
-                if np.linalg.norm(pt - shaft) > 0.005:
-                    return pt
-            return jaw[np.argmax(projections)]
+            def score(pt):
+                align = (pt - mean) @ major
+                dist = np.linalg.norm(pt - shaft)
+                return align + 0.4 * dist
+            return max(jaw, key=score)
 
         raw_tip_right = find_tip(right, shaft_right)
         raw_tip_left = find_tip(left, shaft_left)
-
-
         raw_ring_right = right[np.argmax(np.linalg.norm(right - mean, axis=1))]
         raw_ring_left = left[np.argmax(np.linalg.norm(left - mean, axis=1))]
 
-        # def disambiguate_tip_ring(tip_cand, ring_cand):
-        #     return (tip_cand, ring_cand) if np.linalg.norm(tip_cand - mean) < np.linalg.norm(ring_cand - mean) else (ring_cand, tip_cand)
-        # 
-        # ring_right, tip_right = disambiguate_tip_ring(tip_right, ring_right)
-        # ring_left, tip_left = disambiguate_tip_ring(tip_left, ring_left)
-        
         def disambiguate_tip_ring(p1, p2, prong_vertices, prong_axis):
-            """
-            Decide which point is tip and which is ring, based on shape cues.
-            Arguments:
-                p1, p2: candidate points (3D coords)
-                prong_vertices: vertices of the prong (Nx3 array)
-                prong_axis: major axis of the prong (usually PC0 or PC1)
-            """
             def compute_pointiness_score(p):
-                # Vector from mean to p
                 v = p - prong_vertices.mean(axis=0)
                 v_norm = v / (np.linalg.norm(v) + 1e-8)
-
-                # Alignment with axis (dot product close to 1 → pointy along prong)
                 alignment = np.abs(np.dot(v_norm, prong_axis))
-
-                # Distance from centroid (favor farther points)
                 dist = np.linalg.norm(v)
-
-                return alignment + 0.2 * dist  # Weight can be tuned
-
+                return alignment + 0.3 * dist
             s1 = compute_pointiness_score(p1)
             s2 = compute_pointiness_score(p2)
-
-            if s1 > s2:
-                return p1, p2  # p1 = tip, p2 = ring
+            if s1 > s2 + 0.15:
+                return p1, p2
+            elif s2 > s1 + 0.15:
+                return p2, p1
             else:
-                return p2, p1  # p2 = tip, p1 = ring
+                shaft = prong_vertices[np.argmin(np.abs((prong_vertices - mean) @ prong_axis))]
+                d1 = np.linalg.norm(p1 - shaft)
+                d2 = np.linalg.norm(p2 - shaft)
+                return (p1, p2) if d1 > d2 else (p2, p1)
 
-                
         tip_right, ring_right = disambiguate_tip_ring(raw_tip_right, raw_ring_right, right, major)
         tip_left, ring_left = disambiguate_tip_ring(raw_tip_left, raw_ring_left, left, major)
-
 
         return {
             "tip_right": list(tip_right),
@@ -137,14 +126,12 @@ def get_tool_keypoints_local(tool_name, obj):
         }
 
     elif base.startswith("t") and not base.startswith("nh"):
-        print(f"📌 Tweezer layout (left-right split): {tool_name}")
-
         tip_right = right[np.argmax(local_right[:, 0])]
         tip_left = left[np.argmax(local_left[:, 0])]
 
         def get_midpoint_along_prong(local_prong, prong_vertices):
             fwd = local_prong[:, 0]
-            target = fwd.min() + 0.50 * (fwd.max() - fwd.min())
+            target = fwd.min() + 0.5 * (fwd.max() - fwd.min())
             return prong_vertices[np.argmin(np.abs(fwd - target))]
 
         stem_right = get_midpoint_along_prong(local_right, right)
@@ -156,14 +143,12 @@ def get_tool_keypoints_local(tool_name, obj):
         return {
             "tip_right": list(tip_right),
             "tip_left": list(tip_left),
-            "stem_right": list(stem_right),
-            "stem_left": list(stem_left),
+            "shaft_right": list(stem_right),
+            "shaft_left": list(stem_left),
             "base": list(base_pt),
         }
 
-    else:
-        print(f"⚠️ Fallback to corners for: {tool_name}")
-        return {f"corner_{i}": coord for i, coord in enumerate(obj.get_bound_box())}
+    return {f"corner_{i}": coord for i, coord in enumerate(obj.get_bound_box())}
 
 def object_fully_in_frame(obj, cam2world, cam_obj, scene, margin=0.05):
     mat = obj.get_local2world_mat()
@@ -297,7 +282,7 @@ for img_idx in range(args.num_images):
 
     keypoints_anno = []
     for obj, tool_name in loaded_objs:
-        local_keypoints = get_tool_keypoints_local(tool_name, obj)
+        local_keypoints = get_tool_keypoints_local(tool_name, obj, img_idx)
         named_kps = {}
         for name, kp_local in local_keypoints.items():
             kp_world = obj.get_local2world_mat() @ Vector(list(kp_local) + [1])
