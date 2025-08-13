@@ -1,5 +1,3 @@
-# Converts our custom per-frame keypoint JSON annotations into a COCO-style keypoint dataset.
-
 import os
 import json
 from tqdm import tqdm
@@ -9,23 +7,7 @@ IMAGE_DIR = "/home/student/project/output/coco_data/images"
 KEYPOINT_JSON_DIR = "/home/student/project/output/keypoints"
 COCO_OUTPUT_PATH = "/home/student/project/output/coco_data/annotations.json"
 
-# === TOOL CONFIGURATION ===
-CATEGORY_CONFIG = {
-    "needle_holder": {
-        "id": 1,
-        "keypoints": [
-            "tip_right", "tip_left", "shaft_right", "shaft_left", "ring_right", "ring_left"
-        ]
-    },
-    "tweezer": {
-        "id": 2,
-        "keypoints": [
-            "tip_right", "tip_left", "stem_right", "stem_left", "base"
-        ]
-    }
-}
-
-# 🔒 FIXED keypoint layout for YOLOv8 Pose — must match kpt_shape: [9, 3]
+# === FIXED YOLOv8 keypoint layout (MUST match your YAML!)
 ALL_KEYPOINTS = [
     "tip_right", "tip_left",
     "shaft_right", "shaft_left",
@@ -37,18 +19,23 @@ ALL_KEYPOINTS = [
 coco_output = {
     "images": [],
     "annotations": [],
-    "categories": []
+    "categories": [
+        {
+            "id": 1,
+            "name": "needle_holder",  # ✅ required for write_data_yaml()
+            "supercategory": "tool",
+            "keypoints": ALL_KEYPOINTS,
+            "skeleton": []
+        },
+        {
+            "id": 2,
+            "name": "tweezer",  # ✅ required for write_data_yaml()
+            "supercategory": "tool",
+            "keypoints": ALL_KEYPOINTS,
+            "skeleton": []
+        }
+    ]
 }
-
-# Add categories
-for cat_name, cat_data in CATEGORY_CONFIG.items():
-    coco_output["categories"].append({
-        "id": cat_data["id"],
-        "name": cat_name,
-        "supercategory": "tool",
-        "keypoints": ALL_KEYPOINTS,
-        "skeleton": []
-    })
 
 # === Process each JSON file ===
 image_id = 0
@@ -56,12 +43,14 @@ annotation_id = 1
 
 for file in tqdm(sorted(os.listdir(KEYPOINT_JSON_DIR))):
     if not file.endswith(".json"):
+        print(f"⚠️ Skipping non-JSON file: {file}")
         continue
 
     name = os.path.splitext(file)[0]
     image_file = f"{name}.png"
     image_path = os.path.join(IMAGE_DIR, image_file)
     if not os.path.exists(image_path):
+        print(f"⚠️ Image file not found: {image_file}, skipping...")
         continue
 
     # Add image entry
@@ -72,39 +61,44 @@ for file in tqdm(sorted(os.listdir(KEYPOINT_JSON_DIR))):
         "height": 544
     })
 
-    # Parse keypoints JSON
+    # Load tool annotations
     with open(os.path.join(KEYPOINT_JSON_DIR, file), "r") as f:
         tools = json.load(f)
 
     for tool in tools:
-        name = tool["name"].lower()
-        tool_type = "needle_holder" if name.startswith("nh") else "tweezer"
-        cat_id = CATEGORY_CONFIG[tool_type]["id"]
-        layout = CATEGORY_CONFIG[tool_type]["keypoints"]
+        keypoint_dict = tool["keypoints"]
+        tool_class = 1 if tool["name"].lower().startswith("nh") else 2
+        if tool_class not in [1, 2]:
+            print(f"⚠️ Unknown tool class {tool_class} in {file}, skipping...")
+            continue  # skip unknown
 
         keypoints_flat = []
         visible_count = 0
-        keypoint_dict = tool["keypoints"]
 
         for kpt in ALL_KEYPOINTS:
             if kpt in keypoint_dict:
                 x, y, v = keypoint_dict[kpt]
-                keypoints_flat.extend([x, y, v])
-                if v > 0:
-                    visible_count += 1
             else:
-                keypoints_flat.extend([0, 0, 0])
+                x, y, v = 0, 0, 0
+            keypoints_flat.extend([x, y, v])
+            if v > 0:
+                visible_count += 1
+
+        # get bbox from corresponding JSON
+        bbox = tool.get("bbox", [0, 0, 0, 0])
+        area = bbox[2] * bbox[3]
 
         coco_output["annotations"].append({
             "id": annotation_id,
             "image_id": image_id,
-            "category_id": cat_id,
+            "category_id": tool_class,
             "keypoints": keypoints_flat,
             "num_keypoints": visible_count,
-            "bbox": [0, 0, 0, 0],  # No bbox in our case
+            "bbox": bbox,
             "iscrowd": 0,
-            "area": 1
+            "area": bbox[2] * bbox[3]
         })
+
         annotation_id += 1
 
     image_id += 1

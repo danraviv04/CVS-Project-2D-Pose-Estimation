@@ -20,14 +20,15 @@ def main():
 
     # Train model
     model.train(
-        data=args.data,
-        epochs=args.epochs,
-        imgsz=args.imgsz,
-        batch=args.batch,
-        project=args.project,
-        name=args.name,
-        device=args.device,
-        pretrained=True,
+    task='pose',  # ✅ This is critical!
+    data=args.data,
+    epochs=args.epochs,
+    imgsz=args.imgsz,
+    batch=args.batch,
+    project=args.project,
+    name=args.name,
+    device=args.device,
+    pretrained=True,
     )
 
 
