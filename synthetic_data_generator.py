@@ -64,79 +64,132 @@ def split_coco_annotations(coco_path, images_dir, train_ratio=0.8):
 
     print("✅ COCO annotations split into train/val")
 
-# def write_data_yaml(coco_path, output_dir, expected_kpts):
-#     data_yaml = Path(output_dir) / "yolo_data" / "data.yaml"
-#     with open(coco_path / "annotations_train.json") as f:
-#         sample = json.load(f)
-#         classnames = [cat["name"] for cat in sample["categories"]]
-#         keypoints = sample["categories"][0]["keypoints"]
+def write_data_yaml(
+    coco_path,
+    output_dir,
+    expected_kpts=7,
+    keypoints=None,
+    add_lr_links=True
+):
+    """
+    Create a YOLO pose data.yaml from a COCO-style annotations json.
 
-#     images_dir = Path(output_dir) / "yolo_data" / "images"
-#     with open(data_yaml, "w") as f:
-#         f.write(f"train: {images_dir}/train\n")
-#         f.write(f"val: {images_dir}/val\n\n")
-#         f.write(f"nc: {len(classnames)}\n")
-#         f.write("names:\n")
-#         for i, name in enumerate(classnames):
-#             short = "NH" if "needle" in name.lower() else "T"
-#             f.write(f"  {i}: {short}\n")
-#         f.write(f"\nkpt_shape: [{expected_kpts}, 3]\n")
-#         f.write("keypoints:\n")
-#         for i in range(expected_kpts):
-#             f.write(f"  - kp{i}\n")  # Generic names to match the fixed keypoint count
+    - Infers class names from categories, preserving category id ordering when available.
+    - Writes flip_idx by pairing *_left <-> *_right automatically.
+    - Builds a skeleton anchored at 'base' (index resolved from keypoints).
+    - Optionally adds left-right lines ([0,1], [2,3], [4,5]) for nicer viz.
 
-#     print(f"✅ Wrote data.yaml at: {data_yaml}")
-
-def write_data_yaml(coco_path, output_dir, expected_kpts):
+    Args:
+        coco_path (Path|str): folder that contains annotations_train.json
+        output_dir (Path|str): root output folder that contains yolo_data/images/{train,val}
+        expected_kpts (int): expected number of keypoints
+        keypoints (list[str] or None): override keypoint names/order; if None, use default layout.
+        add_lr_links (bool): if True, add lines between left/right pairs in the skeleton
+    """
     from pathlib import Path
     import json
 
-    data_yaml = Path(output_dir) / "yolo_data" / "data.yaml"
-    with open(coco_path / "annotations_train.json") as f:
+    coco_path = Path(coco_path)
+    output_dir = Path(output_dir)
+    yolo_dir = output_dir / "yolo_data"
+    images_dir = yolo_dir / "images"
+    data_yaml = yolo_dir / "data.yaml"
+    yolo_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- classes (preserve COCO category order; sort by id if present) ---
+    ann_path = coco_path / "annotations_train.json"
+    with ann_path.open("r") as f:
         sample = json.load(f)
-        classnames = [cat["name"] for cat in sample["categories"]]
 
-    # Reordered to match COCO .txt label format
-    keypoints = [
-        "tip_right",
-        "tip_left",
-        "shaft_right",
-        "shaft_left",
-        "ring_right",
-        "ring_left",
-        "base"
-    ]
+    cats = sample.get("categories", [])
+    if not cats:
+        raise ValueError(f"No categories found in {ann_path}")
+
+    if all("id" in c for c in cats):
+        cats = sorted(cats, key=lambda c: c["id"])
+
+    # names as short labels "NH"/"T" to match your setup
+    classnames = []
+    for c in cats:
+        cname = c.get("name", "")
+        short = "NH" if "needle" in cname.lower() or "nh" in cname.lower() else "T"
+        classnames.append(short)
+
+    # --- keypoints order (default to your 7) ---
+    if keypoints is None:
+        keypoints = [
+            "tip_right",
+            "tip_left",
+            "shaft_right",
+            "shaft_left",
+            "ring_right",
+            "ring_left",
+            "base"
+        ]
+
     if len(keypoints) != expected_kpts:
-        raise ValueError(f"Expected {expected_kpts} keypoints, but found {len(keypoints)} in layout.")
+        raise ValueError(
+            f"Expected {expected_kpts} keypoints, but got {len(keypoints)}: {keypoints}"
+        )
 
-    # Center keypoint is 'base' → index 6
-    skeleton = [
-        [6, 0],
-        [6, 1],
-        [6, 2],
-        [6, 3],
-        [6, 4],
-        [6, 5]
-    ]
+    # --- flip_idx (auto from *_left/_right naming) ---
+    name_to_idx = {k: i for i, k in enumerate(keypoints)}
+    flip_idx = []
+    lr_pairs = []  # will also use for optional skeleton links
 
-    images_dir = Path(output_dir) / "yolo_data" / "images"
-    with open(data_yaml, "w") as f:
+    for i, k in enumerate(keypoints):
+        if k.endswith("_right"):
+            twin = k[:-6] + "_left"
+            j = name_to_idx.get(twin, i)
+            flip_idx.append(j)
+            if j != i and (j, i) not in lr_pairs and (i, j) not in lr_pairs:
+                lr_pairs.append((i, j))
+        elif k.endswith("_left"):
+            twin = k[:-5] + "_right"
+            j = name_to_idx.get(twin, i)
+            flip_idx.append(j)
+            if j != i and (j, i) not in lr_pairs and (i, j) not in lr_pairs:
+                lr_pairs.append((j, i) if j < i else (i, j))
+        else:
+            flip_idx.append(i)
+
+    # --- skeleton (anchor at 'base' if present) ---
+    try:
+        base_idx = name_to_idx["base"]
+    except KeyError:
+        # fallback: center-ish anchor
+        base_idx = len(keypoints) // 2
+
+    # edges from base to all others except itself
+    skeleton = [[base_idx, i] for i in range(len(keypoints)) if i != base_idx]
+
+    # optional left-right bars for viz (only for pairs we actually found)
+    if add_lr_links:
+        for (a, b) in lr_pairs:
+            if [a, b] not in skeleton and [b, a] not in skeleton:
+                skeleton.append([a, b])
+
+    # --- write YAML ---
+    with data_yaml.open("w") as f:
         f.write(f"train: {images_dir}/train\n")
         f.write(f"val: {images_dir}/val\n\n")
         f.write(f"nc: {len(classnames)}\n")
         f.write("names:\n")
         for i, name in enumerate(classnames):
-            short = "NH" if "needle" in name.lower() else "T"
-            f.write(f"  {i}: {short}\n")
+            f.write(f"  {i}: {name}\n")
 
         f.write(f"\nkpt_shape: [{len(keypoints)}, 3]\n")
+        f.write("flip_idx: [")
+        f.write(", ".join(str(i) for i in flip_idx))
+        f.write("]\n")
+
         f.write("keypoints:\n")
         for kp in keypoints:
             f.write(f"  - {kp}\n")
 
         f.write("skeleton:\n")
-        for pair in skeleton:
-            f.write(f"  - {pair}\n")
+        for a, b in skeleton:
+            f.write(f"  - [{a}, {b}]\n")
 
     print(f"✅ Wrote data.yaml at: {data_yaml}")
     
@@ -223,7 +276,7 @@ def main():
     if args.debug:
         print("🔍 Debug mode enabled: generating annotated visualizations...")
         subprocess.run([
-            "python3", "data_generation/place_coorrdinates.py",
+            "python3", "data_generation/place_coordinates.py",
             "--image_dir", str(yolo_img_dir / "train"),
             "--json_dir", str(coco_path / "keypoints"),
             "--annotated_dir", str(coco_path / "annotated")

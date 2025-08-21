@@ -1,125 +1,89 @@
-# #!/usr/bin/env python3
-# """This script pastes rendered tool images with transparency onto random backgrounds."""
-
-# import os
-# import random
-# import argparse
-# from PIL import Image
-# from tqdm import tqdm
-
-# def main():
-#     # Parse CLI arguments
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument(
-#         "-i", "--images", type=str, default="/home/student/project/output",
-#         help="Directory containing transparent object images.")
-#     parser.add_argument(
-#         "-b", "--backgrounds", type=str, default="/datashare/project/train2017",
-#         help="Directory containing background images.")
-#     parser.add_argument(
-#         "-t", "--types", default=('jpg', 'jpeg', 'png'), type=str, nargs='+',
-#         help="File types to consider. Default: jp[e]g, png.")
-#     parser.add_argument(
-#         "-w", "--overwrite", action="store_true",
-#         heAlp="If set, overwrite original images. Default: False.")
-#     parser.add_argument(
-#         "-o", "--output", default="composited", type=str,
-#         help="Output directory for composited images.")
-#     args = parser.parse_args()
-
-#     # Setup output directory
-#     output_dir = args.images if args.overwrite else args.output
-#     os.makedirs(output_dir, exist_ok=True)
-
-#     # Gather image and background filenames
-#     input_images = [f for f in os.listdir(args.images) if f.lower().endswith(tuple(args.types))]
-#     backgrounds = [os.path.join(args.backgrounds, f) for f in os.listdir(args.backgrounds)
-#                    if f.lower().endswith(tuple(args.types))]
-
-#     if not input_images:
-#         raise RuntimeError(f"No valid images found in {args.images}")
-#     if not backgrounds:
-#         raise RuntimeError(f"No valid backgrounds found in {args.backgrounds}")
-
-#     # Composite loop
-#     for file_name in tqdm(input_images, desc="Pasting objects"):
-#         img_path = os.path.join(args.images, file_name)
-#         img = Image.open(img_path).convert("RGBA")
-#         img_w, img_h = img.size
-
-#         bg_path = random.choice(backgrounds)
-#         background = Image.open(bg_path).convert("RGB").resize((img_w, img_h))
-
-#         # Paste with transparency mask (alpha channel)
-#         background.paste(img, (0, 0), mask=img.split()[-1])
-
-#         # Save composited image
-#         save_path = os.path.join(output_dir, file_name)
-#         background.save(save_path)
-
-# if __name__ == "__main__":
-#     main()
-
 #!/usr/bin/env python3
-"""Paste rendered RGBA tool images onto random backgrounds (flat output),
-centered, with simple OR-style directional lighting + soft shadow."""
-import os, random, argparse, json
-from PIL import Image, ImageEnhance, ImageFilter
+"""
+Compose full-frame RGBA renders onto backgrounds without cropping or re-centering.
+
+- Keeps the tool image exactly as rendered (no tight-crop, no resize, position=(0,0)).
+- Background is resized to the output frame size (camera.json W/H if given, else tool.size).
+- Optional OR-style relight + soft shadow (computed from the tool alpha).
+- Optional 2-D hand cutouts with alpha, placed near a keypoint if provided.
+"""
+
+import os, random, argparse, json, math, re
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from tqdm import tqdm
 import numpy as np
 
-# ---------- helpers ----------
-def tight_crop_rgba(img, pad=2):
-    a = img.split()[-1]
-    box = a.getbbox()
-    if not box:
-        return img
-    x0, y0, x1, y1 = box
-    return img.crop((max(0, x0 - pad), max(0, y0 - pad),
-                     min(img.width, x1 + pad), min(img.height, y1 + pad)))
-
+HOTSPOT_PROB = 0.10
+# ----------------- lighting helpers -----------------
 def make_dir_light_mask(size, direction=(0, -1), hard=1.25):
-    """0..1 ramp along a direction (slightly harder falloff for OR feel)."""
     w, h = size
     v = np.array(direction, np.float32); v /= (np.linalg.norm(v) + 1e-6)
-    xs = (np.arange(w, dtype=np.float32) - w/2.0)[None, :]
-    ys = (np.arange(h, dtype=np.float32) - h/2.0)[:, None]
+    xs = (np.arange(w, dtype=np.float32) - w / 2.0)[None, :]
+    ys = (np.arange(h, dtype=np.float32) - h / 2.0)[:, None]
     dot = xs * v[0] + ys * v[1]
     dot = (dot - dot.min()) / (dot.max() - dot.min() + 1e-6)
     dot = np.clip(dot ** hard, 0, 1)
     return Image.fromarray((dot * 255).astype(np.uint8))
 
-def relight_tool(tool, light_dir=(0, -1), strength=0.4, contrast_boost=1.12):
-    """Directional brighten/darken + subtle cool tint in highlights."""
-    tool = tool.convert("RGBA")
-    rgb, a = tool.convert("RGB"), tool.split()[-1]
+def estimate_bg_stats(bg_rgb_img, alpha01):
+    bg_np = np.asarray(bg_rgb_img, np.float32)/255.0
+    inv = (alpha01 < 0.01)
+    if inv.any():
+        region = bg_np[inv]
+    else:
+        region = bg_np.reshape(-1,3)
+    L = float((0.2126*region[:,0] + 0.7152*region[:,1] + 0.0722*region[:,2]).mean())
+    tint = region.mean(0)
+    return L, tint
+
+def relight_tool_fullframe(tool_rgba, light_dir=(0,-1), strength=0.35,
+                           contrast_boost=1.08, bg_stats=None):
+    tool_rgba = tool_rgba.convert("RGBA")
+    rgb, a = tool_rgba.convert("RGB"), tool_rgba.split()[-1]
 
     ramp = make_dir_light_mask(rgb.size, light_dir).filter(
         ImageFilter.GaussianBlur(radius=max(1, min(rgb.size)//110))
     )
-    arr = np.asarray(ramp, np.float32) / 255.0
-    light = (arr - 0.5) * 2.0 * strength                       # [-s, s]
+    arr = np.asarray(ramp, np.float32)/255.0
+    light = (arr - 0.5)*2.0*strength
 
-    rgb_arr = np.asarray(rgb, np.float32) / 255.0
-    # base directional light
-    lit = np.clip(rgb_arr * (1.0 + light[..., None]), 0, 1)
+    rgb_arr = np.asarray(rgb, np.float32)/255.0
+    lit = np.clip(rgb_arr*(1.0 + light[...,None]), 0, 1)
 
-    # cool tint only where light > 0 (highlights)
-    highlight = np.clip(light, 0, None)[..., None]
-    cool = np.array([0.98, 1.00, 1.06], dtype=np.float32)      # gentle blue
-    lit = lit * (1.0 - 0.25 * highlight) + (lit * cool) * (0.25 * highlight)
+    # cool tint in highlights
+    highlight = np.clip(light, 0, None)[...,None]
+    cool = np.array([0.98,1.00,1.06], np.float32)
+    lit = lit*(1.0 - 0.25*highlight) + (lit*cool)*(0.25*highlight)
 
-    rgb_lit = Image.fromarray((np.clip(lit, 0, 1) * 255).astype(np.uint8))
+    # ---- match background luminance/tint (optional) ----
+    if bg_stats is not None:
+        L_bg, tint_bg = bg_stats  # L in [0..1], tint RGB in [0..1]
+        L_tool = (0.2126*lit[...,0] + 0.7152*lit[...,1] + 0.0722*lit[...,2]).mean()
+        gain = np.clip(L_bg/(L_tool+1e-6), 0.87, 1.12)
+        lit = np.clip(lit*gain, 0, 1)
+        # tiny tint toward bg color
+        lit = np.clip(lit*0.95 + tint_bg*0.05, 0, 1)
+
+    rgb_lit = Image.fromarray((lit*255).astype(np.uint8))
     rgb_lit = ImageEnhance.Contrast(rgb_lit).enhance(contrast_boost)
-
     return Image.merge("RGBA", (*rgb_lit.split(), a))
 
-def add_shadow(bg_rgba, tool_rgba, pos, light_dir=(0, -1),
+def add_grain(rgb, amount=0.015):
+    arr = np.asarray(rgb, np.float32)/255.0
+    noise = np.random.normal(0, amount, arr.shape).astype(np.float32)
+    out = np.clip(arr + noise, 0, 1)
+    return Image.fromarray((out*255).astype(np.uint8))
+
+
+
+def add_shadow(bg_rgba, tool_rgba, pos=(0, 0), light_dir=(0, -1),
                opacity=0.5, blur_frac=0.018, spread=1.12):
-    """More directional, slightly tighter OR-like shadow."""
+    """Soft drop shadow using tool alpha; tinted & multiplied into BG."""
     x, y = pos
     bg = bg_rgba.convert("RGBA")
     a = tool_rgba.split()[-1]
+    if not a.getbbox():
+        return bg_rgba  # no alpha → skip
 
     max_dim = max(bg.width, bg.height)
     blur = max(1, int(max_dim * blur_frac))
@@ -128,159 +92,421 @@ def add_shadow(bg_rgba, tool_rgba, pos, light_dir=(0, -1),
     off_x = int(-lx * max(4, tool_rgba.width * 0.065))
     off_y = int(-ly * max(4, tool_rgba.height * 0.065))
 
+    # soft mask
     sh = a.resize((int(a.width * spread), int(a.height * spread)), Image.BICUBIC)
     sh = sh.filter(ImageFilter.GaussianBlur(blur))
 
-    shadow_layer = Image.new("RGBA", bg.size, (0, 0, 0, 0))
-    black = Image.new("RGBA", sh.size, (0, 0, 0, int(255 * opacity)))
+    # sample local BG to tint
+    x0 = max(0, x); y0 = max(0, y)
+    x1 = min(bg.width,  x + a.width); y1 = min(bg.height, y + a.height)
+    patch = np.asarray(bg.crop((x0, y0, x1, y1)).convert("RGB"), np.float32) / 255.0
+    c = patch.mean((0, 1)) if patch.size else np.array([0.5, 0.5, 0.5], np.float32)
+
+    # place mask on full canvas
+    shadow_mask = Image.new("L", bg.size, 0)
     sx = x + off_x - (sh.width - a.width)//2
     sy = y + off_y - (sh.height - a.height)//2
-    shadow_layer.paste(black, (sx, sy), mask=sh)
+    shadow_mask.paste(sh, (sx, sy))
 
-    bg.alpha_composite(shadow_layer)
-    return bg
+    # multiply darkening with slight colorization toward local BG
+    k = float(opacity)
+    bg_np = np.asarray(bg.convert("RGB"), np.float32) / 255.0
+    m = (np.asarray(shadow_mask, np.float32) / 255.0)[..., None]
+    tint = c[None, None, :]
+    darkener = 1.0 - k * m
+    out = np.clip(bg_np * (darkener * (0.85 + 0.15 * tint)), 0, 1)
+    return Image.fromarray((out * 255).astype(np.uint8), "RGB").convert("RGBA")
 
-def add_spot_hotspot(bg_rgb, center, radius_frac=0.18, intensity=0.08):
-    """Subtle cool-ish hotspot under the tool (simulating an OR lamp spot)."""
-    cx, cy = center
-    W, H = bg_rgb.size
-    R = int(min(W, H) * radius_frac)
-    if R <= 0:
-        return bg_rgb
 
-    yy, xx = np.ogrid[:H, :W]
-    mask = (xx - cx) ** 2 + (yy - cy) ** 2
-    mask = 1.0 - np.clip(mask / float(R * R), 0, 1)  # 1 in center -> 0 at edge
-    spot = Image.fromarray((mask * 255).astype(np.uint8)).filter(
-        ImageFilter.GaussianBlur(radius=max(2, R // 4))
-    )
+def _as_float_mask01(mask):
+    """Return a (H,W) float32 mask in [0,1] from PIL or numpy input."""
+    # If PIL image -> ndarray
+    if isinstance(mask, Image.Image):
+        arr = np.asarray(mask)
+    elif isinstance(mask, np.ndarray):
+        arr = mask
+    else:
+        raise TypeError(f"Unsupported mask type: {type(mask)}")
 
-    bg = bg_rgb.convert("RGBA")
-    tint = Image.new("RGBA", bg.size, (235, 240, 255, int(255 * intensity)))
-    bg.paste(tint, (0, 0), mask=spot)  # ← fixed: use paste() with mask
-    return bg.convert("RGB")
+    # If it has channels, prefer alpha, else luminance
+    if arr.ndim == 3:
+        if arr.shape[-1] == 4:                 # RGBA
+            arr = arr[..., 3]
+        elif arr.shape[-1] == 1:               # (H,W,1)
+            arr = arr[..., 0]
+        else:                                  # RGB -> luminance
+            arr = 0.2126*arr[...,0] + 0.7152*arr[...,1] + 0.0722*arr[...,2]
 
-# def center_paste_with_lighting(bg_rgb, tool_rgba, min_px=180, max_px=360):
-#     """Center the tool, OR-style light + shadow, return RGB bg."""
-#     tool = tight_crop_rgba(tool_rgba)
-#     a = tool.split()[-1]
-#     if not a.getbbox():
-#         return bg_rgb.convert("RGB")
+    # Normalize to [0,1]
+    arr = arr.astype(np.float32)
+    if arr.max() > 1.0:  # likely 0..255
+        arr /= 255.0
+    arr = np.clip(arr, 0.0, 1.0)
+    return arr
 
-#     # OR lamp: mostly overhead; allow small ±15° jitter
-#     import math
-#     deg = 90 + random.uniform(-15, 15)     # 90° ≈ straight down
-#     ang = math.radians(deg)
-#     light_dir = (np.cos(ang), -np.sin(ang))  # screen-space
+def _to_pil_L(x):
+    """Accepts np.ndarray (0..1 or 0..255) or PIL image; returns PIL 'L'."""
+    if isinstance(x, Image.Image):
+        return x if x.mode == "L" else x.convert("L")
+    a = np.asarray(x)
+    if a.dtype != np.uint8:
+        a = a.astype(np.float32)
+        if a.max() <= 1.0:
+            a = a * 255.0
+        a = np.clip(a, 0, 255).astype(np.uint8)
+    return Image.fromarray(a, mode="L")
 
-#     # scale by longest side
-#     # w, h = tool.size
-#     # target = random.randint(min_px, max_px)
-#     # s = target / float(max(w, h)) if max(w, h) > 0 else 1.0
-#     # tool = tool.resize((max(1, int(w*s)), max(1, int(h*s))), Image.BICUBIC)
+def _pil_gauss(x, sigma):
+    im = _to_pil_L(x)
+    return im.filter(ImageFilter.GaussianBlur(radius=float(sigma)))
 
-#     # ensure not tiny
-#     # if min(tool.width, tool.height) < 48:
-#     #     s = 48.0 / float(min(tool.width, tool.height))
-#     #     tool = tool.resize((int(tool.width*s), int(tool.height*s)), Image.BICUBIC)
+def add_spot_hotspot(
+    bg_rgb_img,
+    alpha_mask01,
+    intensity=None,
+    minmax=(0.02, 0.08),
+    outside_only=True,
+    match_bg=True,
+):
+    # --- ensure inputs ---
+    if alpha_mask01 is None:
+        return bg_rgb_img
+    alpha = _as_float_mask01(alpha_mask01)  # HxW, float32 in [0,1]
+    if alpha.max() <= 0.0:
+        return bg_rgb_img
 
-#     # relight
-#     tool = relight_tool(tool, light_dir=light_dir, strength=0.4, contrast_boost=1.12)
+    bg_np = np.asarray(bg_rgb_img, dtype=np.float32) / 255.0  # RGB
+    yy, xx = np.where(alpha > 0.01)
+    if yy.size:
+        y0, y1 = max(0, yy.min()-40), min(bg_np.shape[0], yy.max()+40)
+        x0, x1 = max(0, xx.min()-40), min(bg_np.shape[1], xx.max()+40)
+        local = bg_np[y0:y1, x0:x1]
+        if local.std() < 0.05:  # almost flat background → skip hotspot
+            return bg_rgb_img
 
-#     # center position
-#     x = (bg_rgb.width - tool.width)//2
-#     y = (bg_rgb.height - tool.height)//2
+    H, W = alpha.shape
+    diag = float(np.hypot(H, W))
 
-#     # subtle hotspot beneath tool
-#     bg_rgb = add_spot_hotspot(bg_rgb, (x + tool.width//2, y + tool.height//2),
-#                               radius_frac=0.16, intensity=0.07)
+    # --- ring = outer blur - inner blur (outside only) ---
+    s_outer = min(max(1.0, 0.06 * diag), 80.0)
+    s_inner = min(max(1.0, 0.02 * diag), 40.0)
+    outer = np.asarray(_pil_gauss(alpha, s_outer), np.float32) / 255.0
+    inner = np.asarray(_pil_gauss(alpha, s_inner), np.float32) / 255.0
+    ring  = np.clip(outer - inner, 0.0, 1.0)
 
-#     # shadow then paste
-#     bg_rgba = add_shadow(bg_rgb, tool, (x, y), light_dir=light_dir,
-#                          opacity=0.5, blur_frac=0.018, spread=1.12)
-#     bg_rgba.alpha_composite(tool, (x, y))
-#     return bg_rgba.convert("RGB")
+    if outside_only:
+        ring *= (1.0 - alpha)
 
-def center_paste_with_lighting(bg_rgb, tool_rgba, min_px=180, max_px=360):
-    # PRESERVE CANVAS: do NOT crop or resize
-    tool = tool_rgba.convert("RGBA")
+    # --- base gain ---
+    gain = float(np.random.uniform(*minmax)) if intensity is None else float(intensity)
 
-    # OR-style light direction (mostly overhead)
-    import math, random as _r
-    deg = 90 + _r.uniform(-15, 15)
+    # --- adapt to background luminance (RGB) ---
+    if match_bg:
+        luma = 0.2126 * bg_np[...,0] + 0.7152 * bg_np[...,1] + 0.0722 * bg_np[...,2]
+        near = ring > 0.01
+        m = float(np.median(luma[near])) if np.any(near) else float(np.median(luma))
+        scale = float(np.interp(m, [0.15, 0.80], [1.0, 0.3]))
+        gain *= scale
+
+    # --- screen blend ---
+    spot   = (ring * gain)[..., None]    # HxWx1
+    out_np = 1.0 - (1.0 - bg_np) * (1.0 - spot)
+    out_np = np.clip(out_np, 0.0, 1.0)
+    return Image.fromarray((out_np * 255).astype(np.uint8), mode="RGB")
+
+# ----------------- 2D hand overlay -----------------
+def load_hand_pool(hands_dir):
+    if not hands_dir or not os.path.isdir(hands_dir):
+        return []
+    exts = (".png", ".webp")
+    pool = []
+    for f in os.listdir(hands_dir):
+        if f.lower().endswith(exts):
+            try:
+                im = Image.open(os.path.join(hands_dir, f)).convert("RGBA")
+                if "A" in im.getbands() and im.getchannel("A").getbbox():
+                    pool.append(im)
+            except Exception:
+                pass
+    return pool
+
+def augment_hand(im, rot_deg_range=(-25, 25), blur_prob=0.3, brighten=(0.9, 1.1), jpeg_prob=0.3):
+    if random.random() < 0.5:
+        im = ImageOps.mirror(im)
+    im = im.rotate(random.uniform(*rot_deg_range), resample=Image.BICUBIC, expand=True)
+    if random.random() < blur_prob:
+        im = im.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.5, 2.0)))
+    if random.random() < 0.8:
+        im = ImageEnhance.Brightness(im).enhance(random.uniform(*brighten))
+    if random.random() < jpeg_prob:
+        from io import BytesIO
+        rgb, a = im.convert("RGB"), im.split()[-1]
+        buf = BytesIO()
+        rgb.save(buf, format="JPEG", quality=random.randint(75, 92))
+        buf.seek(0)
+        rgb = Image.open(buf).convert("RGB")
+        im = Image.merge("RGBA", (*rgb.split(), a))
+    return im
+
+def place_hand(bg, hand_rgba, tool_bbox, side="auto",
+               scale_range=(0.85, 1.15), overlap_frac=0.50):
+    x0, y0, x1, y1 = tool_bbox
+    tw, th = x1 - x0, y1 - y0
+    if tw <= 0 or th <= 0:
+        return bg
+
+    if side == "auto":
+        side = random.choices(["left", "right", "top", "bottom"], weights=[2, 2, 1, 1])[0]
+
+    target_h = th * random.uniform(*scale_range)
+    s = target_h / max(1, hand_rgba.height)
+    hand = hand_rgba.resize((max(1, int(hand_rgba.width * s)),
+                             max(1, int(hand_rgba.height * s))), Image.BICUBIC)
+
+    if side == "left":
+        x = int(x0 - hand.width * (1 - overlap_frac))
+        y = int(y0 + th * random.uniform(0.15, 0.7) - hand.height * 0.5)
+    elif side == "right":
+        x = int(x1 - hand.width * overlap_frac)
+        y = int(y0 + th * random.uniform(0.15, 0.7) - hand.height * 0.5)
+    elif side == "top":
+        x = int(x0 + tw * random.uniform(0.2, 0.8) - hand.width * 0.5)
+        y = int(y0 - hand.height * (1 - overlap_frac))
+    else:
+        x = int(x0 + tw * random.uniform(0.2, 0.8) - hand.width * 0.5)
+        y = int(y1 - hand.height * overlap_frac)
+
+    canvas = bg.copy()
+    canvas.alpha_composite(hand, (x, y))
+    return canvas
+
+# ----------------- background helpers -----------------
+def numeric_stem(name: str) -> str:
+    stem = os.path.splitext(os.path.basename(name))[0]
+    m = re.search(r"\d+", stem)
+    return m.group(0) if m else stem
+
+def resize_bg_to(bg_rgb, target_size, mode="cover"):
+    """Resize background to target frame size without touching the tool.
+       mode:
+         - 'cover': keep aspect, center-crop (default, looks natural)
+         - 'contain': keep aspect, letterbox with black
+         - 'stretch': stretch to target (no crop)
+    """
+    W, H = target_size
+    if mode == "stretch":
+        return bg_rgb.resize((W, H), Image.BICUBIC)
+
+    w, h = bg_rgb.size
+    ar_src, ar_dst = w / h, W / H
+
+    if mode == "contain":
+        # letterbox
+        scale = min(W / w, H / h)
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        scaled = bg_rgb.resize((nw, nh), Image.BICUBIC)
+        canvas = Image.new("RGB", (W, H), (0, 0, 0))
+        canvas.paste(scaled, ((W - nw) // 2, (H - nh) // 2))
+        return canvas
+
+    # cover (default)
+    scale = max(W / w, H / h)
+    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+    scaled = bg_rgb.resize((nw, nh), Image.BICUBIC)
+    x0 = (nw - W) // 2
+    y0 = (nh - H) // 2
+    return scaled.crop((x0, y0, x0 + W, y0 + H))
+
+def feather_rgba(im, r=1.0):
+    r_, g_, b_, a_ = im.split()
+    size = max(3, int(2*max(0.1, r)) | 1)  # odd kernel ≥3
+    a_ = a_.filter(ImageFilter.MaxFilter(size)).filter(ImageFilter.GaussianBlur(0.6 * r))
+    return Image.merge("RGBA", (r_, g_, b_, a_))
+
+# ----------------- composition (no crop/recenter) -----------------
+def compose_fullframe(bg_rgb, tool_rgba, hand_pool=None, hand_prob=0.65, keypoint_xy=None,
+                      bg_fit_mode="cover"):
+    """
+    Keep tool at (0,0), same size as output. Background is resized to frame size.
+    """
+    # Determine final frame size from the tool (full frame)
+    frame_size = tool_rgba.size
+
+    # Resize background to that frame size (tool is untouched)
+    bg_rgb = resize_bg_to(bg_rgb, frame_size, mode=bg_fit_mode)
+
+    # OR lamp direction (mostly overhead)
+    deg = 90 + random.uniform(-15, 15)
     ang = math.radians(deg)
     light_dir = (np.cos(ang), -np.sin(ang))
 
-    # relight on full canvas (alpha protects background)
-    tool = relight_tool(tool, light_dir=light_dir, strength=0.4, contrast_boost=1.12)
+    # Relight (does not move or resize the tool)
 
-    # paste position: top-left of the same-sized canvas → labels unchanged
-    x, y = 0, 0
+    a = tool_rgba.split()[-1]
+    alpha01 = np.asarray(a, np.float32)/255.0
+    bg_stats = estimate_bg_stats(bg_rgb, alpha01)
+    tool_relit = relight_tool_fullframe(tool_rgba, light_dir=light_dir,
+                                        strength=random.uniform(0.25,0.40),
+                                        contrast_boost=1.08,
+                                    bg_stats=bg_stats)
 
-    # optional hotspot under existing tool center (uses the same canvas)
-    cx, cy = tool.width // 2, tool.height // 2
-    bg_rgb = add_spot_hotspot(bg_rgb, (cx, cy), radius_frac=0.16, intensity=0.07)
 
-    # shadow using the tool alpha
-    bg_rgba = add_shadow(bg_rgb, tool, (x, y), light_dir=light_dir,
-                         opacity=0.5, blur_frac=0.018, spread=1.12)
-    bg_rgba.alpha_composite(tool, (x, y))
+    tool_relit = feather_rgba(tool_relit, r=random.uniform(0.6, 1.4))
+    
+    a = tool_relit.split()[-1]  # PIL 'L' alpha
+    alpha01 = np.asarray(a, dtype=np.float32) / 255.0
+    
+    if np.random.rand() < HOTSPOT_PROB:
+        bg_rgb = add_spot_hotspot(
+            bg_rgb_img=bg_rgb,
+            alpha_mask01=alpha01,
+            minmax=(0.02, 0.06),
+            outside_only=True,
+            match_bg=True
+        )
+        
+    # Shadow first, then the tool (position fixed at 0,0)
+    bg_rgba = add_shadow(
+        bg_rgb, tool_relit, pos=(0, 0), light_dir=light_dir,
+        opacity=random.uniform(0.35, 0.55),
+        blur_frac=random.uniform(0.014, 0.022),
+        spread=random.uniform(1.08, 1.16)
+    )
+    bg_rgba.alpha_composite(tool_relit, (0, 0))
+    bg_std = np.asarray(bg_rgba.convert("RGB"), np.uint8).std()
+    grain_amt = 0.006 if bg_std < 25 else 0.012
+    bg_rgb = add_grain(bg_rgba.convert("RGB"), amount=grain_amt)
+    bg_rgba = bg_rgb.convert("RGBA")
+
+    # Optional hand overlay
+    alpha_bbox = a.getbbox()
+    if hand_pool and len(hand_pool) and random.random() < hand_prob and alpha_bbox:
+        hand = augment_hand(random.choice(hand_pool))
+        x0, y0, x1, y1 = alpha_bbox
+        th = (y1 - y0)
+
+        if keypoint_xy:
+            # Anchor near provided keypoint in frame coords
+            kx, ky = keypoint_xy
+            target_h = th * random.uniform(0.8, 1.15)
+            s = target_h / max(1, hand.height)
+            hand = hand.resize((max(1, int(hand.width * s)),
+                                max(1, int(hand.height * s))), Image.BICUBIC)
+            kx += random.randint(-int(th * 0.1), int(th * 0.1))
+            ky += random.randint(-int(th * 0.1), int(th * 0.1))
+            hx = int(kx - hand.width * 0.45)
+            hy = int(ky - hand.height * 0.55)
+            bg_rgba.alpha_composite(hand, (hx, hy))
+        else:
+            bg_rgba = place_hand(bg_rgba, hand, alpha_bbox, side="auto",
+                                 scale_range=(0.85, 1.15), overlap_frac=0.50)
+
     return bg_rgba.convert("RGB")
 
-# ---------- main (unchanged CLI/IO) ----------
+# ----------------- CLI -----------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--images", type=str, default="/home/student/project/output",
-                        help="Directory containing transparent object images.")
-    parser.add_argument("-b", "--backgrounds", type=str, default="/datashare/project/train2017",
-                        help="Directory containing background images.")
-    parser.add_argument("-t", "--types", default=('jpg', 'jpeg', 'png'), type=str, nargs='+',
-                        help="File types to consider. Default: jpg, jpeg, png.")
+    parser.add_argument("-i", "--images", type=str, required=True,
+                        help="Folder with full-frame transparent tool renders (PNG/JPG with alpha).")
+    parser.add_argument("-b", "--backgrounds", type=str, required=True,
+                        help="Folder with background photos.")
+    parser.add_argument("-t", "--types", default=('jpg', 'jpeg', 'png', 'webp'), type=str, nargs='+',
+                        help="Background file types.")
+    parser.add_argument("-o", "--output", required=True, type=str,
+                        help="Output folder.")
     parser.add_argument("-w", "--overwrite", action="store_true",
-                        help="If set, overwrite original images. Default: False.")
-    parser.add_argument("-o", "--output", default="/home/student/project/output/composited", type=str,
-                        help="Output directory for composited images.")
+                        help="Overwrite images in --images instead of writing to --output.")
     parser.add_argument("--camera_json", type=str, default=None,
-                        help="Optional camera.json with width/height to force output size.")
-    parser.add_argument("--min_px", type=int, default=180,
-                        help="Min longest-side pixels for pasted tool.")
-    parser.add_argument("--max_px", type=int, default=360,
-                        help="Max longest-side pixels for pasted tool.")
+                        help="If given, force output W/H (must match render size).")
+    parser.add_argument("--bg_fit", type=str, default="cover", choices=["cover", "contain", "stretch"],
+                        help="How to fit background to the frame size (tool stays untouched).")
+    parser.add_argument("--hands", type=str, default=None,
+                        help="Folder of hand PNG/WebP cutouts with alpha.")
+    parser.add_argument("--hand_prob", type=float, default=0.65,
+                        help="Probability to overlay a hand.")
+    parser.add_argument("--keypoints_dir", type=str, default=None,
+                        help="Folder with keypoint JSON per image (same numeric stem).")
     args = parser.parse_args()
 
-    output_dir = args.images if args.overwrite else args.output
-    os.makedirs(output_dir, exist_ok=True)
+    out_dir = args.images if args.overwrite else args.output
+    os.makedirs(out_dir, exist_ok=True)
 
-    # optional fixed output size
-    target_size = None
+    # Gather tool images
+    tool_files = [f for f in os.listdir(args.images)
+                  if f.lower().endswith((".png", ".webp", ".jpg", ".jpeg"))]
+    if not tool_files:
+        raise RuntimeError(f"No tool images found in {args.images}")
+
+    # Gather backgrounds
+    bg_files = [os.path.join(args.backgrounds, f) for f in os.listdir(args.backgrounds)
+                if f.lower().endswith(tuple(args.types))]
+    if not bg_files:
+        raise RuntimeError(f"No background images found in {args.backgrounds}")
+
+    # Optional hand pool
+    hand_pool = load_hand_pool(args.hands) if args.hands else []
+
+    # Optional fixed size from camera.json (sanity check only)
+    forced_size = None
     if args.camera_json and os.path.exists(args.camera_json):
         with open(args.camera_json, "r") as f:
             cam = json.load(f)
-        target_size = (int(cam["width"]), int(cam["height"]))
+        forced_size = (int(cam["width"]), int(cam["height"]))
 
-    input_images = [f for f in os.listdir(args.images)
-                    if f.lower().endswith(tuple(args.types))]
-    backgrounds = [os.path.join(args.backgrounds, f) for f in os.listdir(args.backgrounds)
-                   if f.lower().endswith(tuple(args.types))]
+    def read_ring_kp(stem):
+        if not args.keypoints_dir:
+            return None
+        jp = os.path.join(args.keypoints_dir, f"{stem}.json")
+        if not os.path.exists(jp):
+            return None
+        try:
+            with open(jp, "r") as f:
+                data = json.load(f)
+            # look for ring keypoints if present
+            for obj in data:
+                kps = obj.get("keypoints", {})
+                rR = kps.get("ring_right", [0, 0, 0])
+                rL = kps.get("ring_left",  [0, 0, 0])
+                if rR[2] > 0 and rL[2] > 0:
+                    return ((rR[0] + rL[0]) // 2, (rR[1] + rL[1]) // 2)
+                if rR[2] > 0:
+                    return (rR[0], rR[1])
+                if rL[2] > 0:
+                    return (rL[0], rL[1])
+        except Exception:
+            return None
+        return None
 
-    if not input_images:
-        raise RuntimeError(f"No valid images found in {args.images}")
-    if not backgrounds:
-        raise RuntimeError(f"No valid backgrounds found in {args.backgrounds}")
-
-    for file_name in tqdm(input_images, desc="Pasting objects"):
-        tool_path = os.path.join(args.images, file_name)
+    for name in tqdm(tool_files, desc="Compositing"):
+        tool_path = os.path.join(args.images, name)
         tool_rgba = Image.open(tool_path).convert("RGBA")
 
-        if target_size:
-            bg = Image.open(random.choice(backgrounds)).convert("RGB").resize(target_size, Image.BICUBIC)
+        # Enforce expected frame size if supplied
+        if forced_size and tool_rgba.size != forced_size:
+            # optional: warn but keep tool untouched
+            pass
+
+        # Choose & prep background to match the tool's full frame size
+        bg = Image.open(random.choice(bg_files)).convert("RGB")
+        if forced_size:
+            bg = resize_bg_to(bg, forced_size, mode=args.bg_fit)
         else:
-            bg = Image.open(random.choice(backgrounds)).convert("RGB").resize(tool_rgba.size, Image.BICUBIC)
+            bg = resize_bg_to(bg, tool_rgba.size, mode=args.bg_fit)
 
-        out = center_paste_with_lighting(bg, tool_rgba,
-                                         min_px=args.min_px, max_px=args.max_px)
+        # Optional ring anchor from keypoints (frame coords)
+        stem = numeric_stem(name)
+        ring_xy = read_ring_kp(stem)
 
-        out.save(os.path.join(output_dir, file_name))
+        out = compose_fullframe(
+            bg_rgb=bg,
+            tool_rgba=tool_rgba,           # not cropped, not resized, pasted at (0,0)
+            hand_pool=hand_pool,
+            hand_prob=args.hand_prob,
+            keypoint_xy=ring_xy,
+            bg_fit_mode=args.bg_fit
+        )
+
+        out.save(os.path.join(out_dir, name), quality=95)
 
 if __name__ == "__main__":
     main()
