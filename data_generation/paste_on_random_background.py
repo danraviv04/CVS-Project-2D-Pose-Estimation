@@ -6,15 +6,88 @@ Compose full-frame RGBA renders onto backgrounds without cropping or re-centerin
 - Background is resized to the output frame size (camera.json W/H if given, else tool.size).
 - Optional OR-style relight + soft shadow (computed from the tool alpha).
 - Optional 2-D hand cutouts with alpha, placed near a keypoint if provided.
+- Writes a COCO JSON of full-silhouette masks (pre-occlusion) if --coco_out is provided.
 """
 
 import os, random, argparse, json, math, re
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from tqdm import tqdm
 import numpy as np
+import cv2
+from pycocotools import mask as m
+from PIL import ImageFont, ImageDraw
+
+def draw_label_on_top(img_rgba, text, xy, fg=(255,255,255), bg=(0,0,0), pad=2):
+    """Draw readable label above everything with a tiny shadow box."""
+    draw = ImageDraw.Draw(img_rgba)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 18)
+    except Exception:
+        font = ImageFont.load_default()
+
+    bbox = draw.textbbox(xy, text, font=font)
+    # pad background rectangle
+    x0, y0, x1, y1 = bbox
+    x0 -= pad; y0 -= pad; x1 += pad; y1 += pad
+    draw.rectangle([x0, y0, x1, y1], fill=bg + (180,))   # semi-transparent bg
+    draw.text(xy, text, fill=fg + (255,), font=font, stroke_width=2, stroke_fill=(0,0,0,255))
+
+# ----------------- RLE / COCO helpers -----------------
+
+def rle_from_rgba(tool_rgba, M, out_w, out_h, thr=8):
+    """
+    tool_rgba: PIL.Image RGBA of the tool BEFORE occluders
+    M: 2x3 affine you used to place the tool (same rotation/scale/shift)
+    out_w, out_h: canvas size
+    thr: alpha threshold (0-255) to consider as foreground
+    returns: (rle_dict, mask_bin) where rle_dict has ascii 'counts'
+    """
+    # 1) alpha -> binary mask
+    alpha = np.array(tool_rgba.getchannel("A"), dtype=np.uint8)
+    mask = (alpha >= thr).astype(np.uint8)
+
+    # 2) warp mask exactly like the tool image
+    mask_warp = cv2.warpAffine(
+        mask, M, (out_w, out_h),
+        flags=cv2.INTER_NEAREST, borderValue=0
+    )
+    # ensure strictly 0/1 uint8
+    mask_warp = (mask_warp > 0).astype(np.uint8)
+
+    # 3) encode to COCO RLE (expects Fortran-order HxWx1)
+    rle = m.encode(np.asfortranarray(mask_warp[:, :, None]))
+
+    # pycocotools may return a list even for single mask -> take first
+    if isinstance(rle, list):
+        rle = rle[0]
+
+    # 'counts' may be bytes -> decode to ascii for JSON
+    if isinstance(rle.get("counts", None), (bytes, bytearray)):
+        rle["counts"] = rle["counts"].decode("ascii")
+
+    return rle, mask_warp
+
+def coco_ann_from_mask(rle, mask_bin, cat_id, image_id, ann_id):
+    ys, xs = np.where(mask_bin > 0)
+    if ys.size == 0 or xs.size == 0:
+        # empty mask -> caller should handle (we'll return None)
+        return None
+    x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+    bbox = [x0, y0, x1 - x0 + 1, y1 - y0 + 1]
+    return {
+        "id": ann_id,
+        "image_id": image_id,
+        "category_id": cat_id,
+        "iscrowd": 0,
+        "segmentation": rle,
+        "area": float(m.area(rle)),
+        "bbox": bbox,
+    }
+
+# ----------------- lighting helpers -----------------
 
 HOTSPOT_PROB = 0.10
-# ----------------- lighting helpers -----------------
+
 def make_dir_light_mask(size, direction=(0, -1), hard=1.25):
     w, h = size
     v = np.array(direction, np.float32); v /= (np.linalg.norm(v) + 1e-6)
@@ -26,17 +99,14 @@ def make_dir_light_mask(size, direction=(0, -1), hard=1.25):
     return Image.fromarray((dot * 255).astype(np.uint8))
 
 def estimate_bg_stats(bg_rgb_img, alpha01):
-    bg_np = np.asarray(bg_rgb_img, np.float32)/255.0
+    bg_np = np.asarray(bg_rgb_img, np.float32) / 255.0
     inv = (alpha01 < 0.01)
-    if inv.any():
-        region = bg_np[inv]
-    else:
-        region = bg_np.reshape(-1,3)
+    region = bg_np[inv] if inv.any() else bg_np.reshape(-1, 3)
     L = float((0.2126*region[:,0] + 0.7152*region[:,1] + 0.0722*region[:,2]).mean())
     tint = region.mean(0)
     return L, tint
 
-def relight_tool_fullframe(tool_rgba, light_dir=(0,-1), strength=0.35,
+def relight_tool_fullframe(tool_rgba, light_dir=(0, -1), strength=0.35,
                            contrast_boost=1.08, bg_stats=None):
     tool_rgba = tool_rgba.convert("RGBA")
     rgb, a = tool_rgba.convert("RGB"), tool_rgba.split()[-1]
@@ -44,37 +114,34 @@ def relight_tool_fullframe(tool_rgba, light_dir=(0,-1), strength=0.35,
     ramp = make_dir_light_mask(rgb.size, light_dir).filter(
         ImageFilter.GaussianBlur(radius=max(1, min(rgb.size)//110))
     )
-    arr = np.asarray(ramp, np.float32)/255.0
-    light = (arr - 0.5)*2.0*strength
+    arr = np.asarray(ramp, np.float32) / 255.0
+    light = (arr - 0.5) * 2.0 * strength
 
-    rgb_arr = np.asarray(rgb, np.float32)/255.0
-    lit = np.clip(rgb_arr*(1.0 + light[...,None]), 0, 1)
+    rgb_arr = np.asarray(rgb, np.float32) / 255.0
+    lit = np.clip(rgb_arr * (1.0 + light[..., None]), 0, 1)
 
     # cool tint in highlights
-    highlight = np.clip(light, 0, None)[...,None]
-    cool = np.array([0.98,1.00,1.06], np.float32)
-    lit = lit*(1.0 - 0.25*highlight) + (lit*cool)*(0.25*highlight)
+    highlight = np.clip(light, 0, None)[..., None]
+    cool = np.array([0.98, 1.00, 1.06], np.float32)
+    lit = lit * (1.0 - 0.25 * highlight) + (lit * cool) * (0.25 * highlight)
 
-    # ---- match background luminance/tint (optional) ----
+    # match background luminance/tint
     if bg_stats is not None:
-        L_bg, tint_bg = bg_stats  # L in [0..1], tint RGB in [0..1]
+        L_bg, tint_bg = bg_stats
         L_tool = (0.2126*lit[...,0] + 0.7152*lit[...,1] + 0.0722*lit[...,2]).mean()
-        gain = np.clip(L_bg/(L_tool+1e-6), 0.87, 1.12)
-        lit = np.clip(lit*gain, 0, 1)
-        # tiny tint toward bg color
-        lit = np.clip(lit*0.95 + tint_bg*0.05, 0, 1)
+        gain = np.clip(L_bg / (L_tool + 1e-6), 0.87, 1.12)
+        lit = np.clip(lit * gain, 0, 1)
+        lit = np.clip(lit * 0.95 + tint_bg * 0.05, 0, 1)
 
-    rgb_lit = Image.fromarray((lit*255).astype(np.uint8))
+    rgb_lit = Image.fromarray((lit * 255).astype(np.uint8))
     rgb_lit = ImageEnhance.Contrast(rgb_lit).enhance(contrast_boost)
     return Image.merge("RGBA", (*rgb_lit.split(), a))
 
 def add_grain(rgb, amount=0.015):
-    arr = np.asarray(rgb, np.float32)/255.0
+    arr = np.asarray(rgb, np.float32) / 255.0
     noise = np.random.normal(0, amount, arr.shape).astype(np.float32)
     out = np.clip(arr + noise, 0, 1)
-    return Image.fromarray((out*255).astype(np.uint8))
-
-
+    return Image.fromarray((out * 255).astype(np.uint8))
 
 def add_shadow(bg_rgba, tool_rgba, pos=(0, 0), light_dir=(0, -1),
                opacity=0.5, blur_frac=0.018, spread=1.12):
@@ -111,16 +178,16 @@ def add_shadow(bg_rgba, tool_rgba, pos=(0, 0), light_dir=(0, -1),
     # multiply darkening with slight colorization toward local BG
     k = float(opacity)
     bg_np = np.asarray(bg.convert("RGB"), np.float32) / 255.0
-    m = (np.asarray(shadow_mask, np.float32) / 255.0)[..., None]
+    msk = (np.asarray(shadow_mask, np.float32) / 255.0)[..., None]
     tint = c[None, None, :]
-    darkener = 1.0 - k * m
+    darkener = 1.0 - k * msk
     out = np.clip(bg_np * (darkener * (0.85 + 0.15 * tint)), 0, 1)
     return Image.fromarray((out * 255).astype(np.uint8), "RGB").convert("RGBA")
 
+# ----------------- hotspot -----------------
 
 def _as_float_mask01(mask):
-    """Return a (H,W) float32 mask in [0,1] from PIL or numpy input."""
-    # If PIL image -> ndarray
+    # PIL or np -> float HxW in [0,1]
     if isinstance(mask, Image.Image):
         arr = np.asarray(mask)
     elif isinstance(mask, np.ndarray):
@@ -128,24 +195,20 @@ def _as_float_mask01(mask):
     else:
         raise TypeError(f"Unsupported mask type: {type(mask)}")
 
-    # If it has channels, prefer alpha, else luminance
     if arr.ndim == 3:
-        if arr.shape[-1] == 4:                 # RGBA
+        if arr.shape[-1] == 4:      # RGBA
             arr = arr[..., 3]
-        elif arr.shape[-1] == 1:               # (H,W,1)
+        elif arr.shape[-1] == 1:
             arr = arr[..., 0]
-        else:                                  # RGB -> luminance
+        else:                        # RGB -> luminance
             arr = 0.2126*arr[...,0] + 0.7152*arr[...,1] + 0.0722*arr[...,2]
 
-    # Normalize to [0,1]
     arr = arr.astype(np.float32)
-    if arr.max() > 1.0:  # likely 0..255
+    if arr.max() > 1.0:
         arr /= 255.0
-    arr = np.clip(arr, 0.0, 1.0)
-    return arr
+    return np.clip(arr, 0.0, 1.0)
 
 def _to_pil_L(x):
-    """Accepts np.ndarray (0..1 or 0..255) or PIL image; returns PIL 'L'."""
     if isinstance(x, Image.Image):
         return x if x.mode == "L" else x.convert("L")
     a = np.asarray(x)
@@ -160,47 +223,35 @@ def _pil_gauss(x, sigma):
     im = _to_pil_L(x)
     return im.filter(ImageFilter.GaussianBlur(radius=float(sigma)))
 
-def add_spot_hotspot(
-    bg_rgb_img,
-    alpha_mask01,
-    intensity=None,
-    minmax=(0.02, 0.08),
-    outside_only=True,
-    match_bg=True,
-):
-    # --- ensure inputs ---
+def add_spot_hotspot(bg_rgb_img, alpha_mask01, intensity=None,
+                     minmax=(0.02, 0.08), outside_only=True, match_bg=True):
     if alpha_mask01 is None:
         return bg_rgb_img
-    alpha = _as_float_mask01(alpha_mask01)  # HxW, float32 in [0,1]
+    alpha = _as_float_mask01(alpha_mask01)
     if alpha.max() <= 0.0:
         return bg_rgb_img
 
-    bg_np = np.asarray(bg_rgb_img, dtype=np.float32) / 255.0  # RGB
+    bg_np = np.asarray(bg_rgb_img, dtype=np.float32) / 255.0
     yy, xx = np.where(alpha > 0.01)
     if yy.size:
         y0, y1 = max(0, yy.min()-40), min(bg_np.shape[0], yy.max()+40)
         x0, x1 = max(0, xx.min()-40), min(bg_np.shape[1], xx.max()+40)
         local = bg_np[y0:y1, x0:x1]
-        if local.std() < 0.05:  # almost flat background → skip hotspot
+        if local.std() < 0.05:
             return bg_rgb_img
 
     H, W = alpha.shape
     diag = float(np.hypot(H, W))
-
-    # --- ring = outer blur - inner blur (outside only) ---
     s_outer = min(max(1.0, 0.06 * diag), 80.0)
     s_inner = min(max(1.0, 0.02 * diag), 40.0)
     outer = np.asarray(_pil_gauss(alpha, s_outer), np.float32) / 255.0
     inner = np.asarray(_pil_gauss(alpha, s_inner), np.float32) / 255.0
     ring  = np.clip(outer - inner, 0.0, 1.0)
-
     if outside_only:
         ring *= (1.0 - alpha)
 
-    # --- base gain ---
     gain = float(np.random.uniform(*minmax)) if intensity is None else float(intensity)
 
-    # --- adapt to background luminance (RGB) ---
     if match_bg:
         luma = 0.2126 * bg_np[...,0] + 0.7152 * bg_np[...,1] + 0.0722 * bg_np[...,2]
         near = ring > 0.01
@@ -208,13 +259,13 @@ def add_spot_hotspot(
         scale = float(np.interp(m, [0.15, 0.80], [1.0, 0.3]))
         gain *= scale
 
-    # --- screen blend ---
-    spot   = (ring * gain)[..., None]    # HxWx1
-    out_np = 1.0 - (1.0 - bg_np) * (1.0 - spot)
+    spot   = (ring * gain)[..., None]
+    out_np = 1.0 - (1.0 - bg_np) * (1.0 - spot)  # screen
     out_np = np.clip(out_np, 0.0, 1.0)
     return Image.fromarray((out_np * 255).astype(np.uint8), mode="RGB")
 
 # ----------------- 2D hand overlay -----------------
+
 def load_hand_pool(hands_dir):
     if not hands_dir or not os.path.isdir(hands_dir):
         return []
@@ -281,27 +332,20 @@ def place_hand(bg, hand_rgba, tool_bbox, side="auto",
     return canvas
 
 # ----------------- background helpers -----------------
+
 def numeric_stem(name: str) -> str:
     stem = os.path.splitext(os.path.basename(name))[0]
     m = re.search(r"\d+", stem)
     return m.group(0) if m else stem
 
 def resize_bg_to(bg_rgb, target_size, mode="cover"):
-    """Resize background to target frame size without touching the tool.
-       mode:
-         - 'cover': keep aspect, center-crop (default, looks natural)
-         - 'contain': keep aspect, letterbox with black
-         - 'stretch': stretch to target (no crop)
-    """
+    """Resize background to target frame size without touching the tool."""
     W, H = target_size
     if mode == "stretch":
         return bg_rgb.resize((W, H), Image.BICUBIC)
 
     w, h = bg_rgb.size
-    ar_src, ar_dst = w / h, W / H
-
     if mode == "contain":
-        # letterbox
         scale = min(W / w, H / h)
         nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
         scaled = bg_rgb.resize((nw, nh), Image.BICUBIC)
@@ -309,7 +353,7 @@ def resize_bg_to(bg_rgb, target_size, mode="cover"):
         canvas.paste(scaled, ((W - nw) // 2, (H - nh) // 2))
         return canvas
 
-    # cover (default)
+    # cover
     scale = max(W / w, H / h)
     nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
     scaled = bg_rgb.resize((nw, nh), Image.BICUBIC)
@@ -319,20 +363,16 @@ def resize_bg_to(bg_rgb, target_size, mode="cover"):
 
 def feather_rgba(im, r=1.0):
     r_, g_, b_, a_ = im.split()
-    size = max(3, int(2*max(0.1, r)) | 1)  # odd kernel ≥3
+    size = max(3, int(2 * max(0.1, r)) | 1)  # odd kernel ≥3
     a_ = a_.filter(ImageFilter.MaxFilter(size)).filter(ImageFilter.GaussianBlur(0.6 * r))
     return Image.merge("RGBA", (r_, g_, b_, a_))
 
 # ----------------- composition (no crop/recenter) -----------------
+
 def compose_fullframe(bg_rgb, tool_rgba, hand_pool=None, hand_prob=0.65, keypoint_xy=None,
                       bg_fit_mode="cover"):
-    """
-    Keep tool at (0,0), same size as output. Background is resized to frame size.
-    """
-    # Determine final frame size from the tool (full frame)
+    """Keep tool at (0,0); background resized to frame size."""
     frame_size = tool_rgba.size
-
-    # Resize background to that frame size (tool is untouched)
     bg_rgb = resize_bg_to(bg_rgb, frame_size, mode=bg_fit_mode)
 
     # OR lamp direction (mostly overhead)
@@ -340,22 +380,21 @@ def compose_fullframe(bg_rgb, tool_rgba, hand_pool=None, hand_prob=0.65, keypoin
     ang = math.radians(deg)
     light_dir = (np.cos(ang), -np.sin(ang))
 
-    # Relight (does not move or resize the tool)
-
     a = tool_rgba.split()[-1]
-    alpha01 = np.asarray(a, np.float32)/255.0
+    alpha01 = np.asarray(a, np.float32) / 255.0
     bg_stats = estimate_bg_stats(bg_rgb, alpha01)
-    tool_relit = relight_tool_fullframe(tool_rgba, light_dir=light_dir,
-                                        strength=random.uniform(0.25,0.40),
-                                        contrast_boost=1.08,
-                                    bg_stats=bg_stats)
-
+    tool_relit = relight_tool_fullframe(
+        tool_rgba, light_dir=light_dir,
+        strength=random.uniform(0.25, 0.40),
+        contrast_boost=1.08,
+        bg_stats=bg_stats
+    )
 
     tool_relit = feather_rgba(tool_relit, r=random.uniform(0.6, 1.4))
-    
-    a = tool_relit.split()[-1]  # PIL 'L' alpha
+
+    a = tool_relit.split()[-1]
     alpha01 = np.asarray(a, dtype=np.float32) / 255.0
-    
+
     if np.random.rand() < HOTSPOT_PROB:
         bg_rgb = add_spot_hotspot(
             bg_rgb_img=bg_rgb,
@@ -364,8 +403,8 @@ def compose_fullframe(bg_rgb, tool_rgba, hand_pool=None, hand_prob=0.65, keypoin
             outside_only=True,
             match_bg=True
         )
-        
-    # Shadow first, then the tool (position fixed at 0,0)
+
+    # Shadow then tool (fixed at 0,0)
     bg_rgba = add_shadow(
         bg_rgb, tool_relit, pos=(0, 0), light_dir=light_dir,
         opacity=random.uniform(0.35, 0.55),
@@ -373,6 +412,8 @@ def compose_fullframe(bg_rgb, tool_rgba, hand_pool=None, hand_prob=0.65, keypoin
         spread=random.uniform(1.08, 1.16)
     )
     bg_rgba.alpha_composite(tool_relit, (0, 0))
+
+    # Add grain
     bg_std = np.asarray(bg_rgba.convert("RGB"), np.uint8).std()
     grain_amt = 0.006 if bg_std < 25 else 0.012
     bg_rgb = add_grain(bg_rgba.convert("RGB"), amount=grain_amt)
@@ -401,9 +442,27 @@ def compose_fullframe(bg_rgb, tool_rgba, hand_pool=None, hand_prob=0.65, keypoin
             bg_rgba = place_hand(bg_rgba, hand, alpha_bbox, side="auto",
                                  scale_range=(0.85, 1.15), overlap_frac=0.50)
 
+    if getattr(compose_fullframe, "_label_text", None): 
+        try:
+            # if you pass a text into compose_fullframe, use it; otherwise infer from filename upstream
+            if hasattr(compose_fullframe, "_label_text") and compose_fullframe._label_text:
+                label_txt = compose_fullframe._label_text
+            else:
+                label_txt = "Needle Holder"  # or "Tweezers" – set per image upstream
+
+            # put it near the tool alpha bbox center (or wherever you prefer)
+            if alpha_bbox:
+                x0, y0, x1, y1 = alpha_bbox
+                cx, cy = int((x0 + x1) / 2), int((y0 + y1) / 2)
+                draw_label_on_top(bg_rgba, label_txt, (cx, cy))
+        except Exception:
+            pass
+
     return bg_rgba.convert("RGB")
 
+
 # ----------------- CLI -----------------
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-i", "--images", type=str, required=True,
@@ -426,10 +485,28 @@ def main():
                         help="Probability to overlay a hand.")
     parser.add_argument("--keypoints_dir", type=str, default=None,
                         help="Folder with keypoint JSON per image (same numeric stem).")
+    parser.add_argument("--coco_out", type=str, default=None,
+                        help="If set, write a single COCO json here (full-silhouette segs).")
+    parser.add_argument("--add_text_labels", action="store_true",
+                    help="Overlay tool name text on composites")
+
     args = parser.parse_args()
 
     out_dir = args.images if args.overwrite else args.output
     os.makedirs(out_dir, exist_ok=True)
+
+    # COCO buffers
+    images_coco, annotations_coco = [], []
+    categories_coco = [
+        {"id": 1, "name": "needle_holder", "supercategory": "surgical_tool"},
+        {"id": 2, "name": "tweezers",      "supercategory": "surgical_tool"},
+    ]
+    next_img_id = 1
+    next_ann_id = 1
+
+    def cat_id_from_filename(fname: str) -> int:
+        s = os.path.basename(fname).lower()
+        return 1 if s.startswith("nh") or "needle" in s else 2  # NH -> 1, T -> 2
 
     # Gather tool images
     tool_files = [f for f in os.listdir(args.images)
@@ -462,7 +539,6 @@ def main():
         try:
             with open(jp, "r") as f:
                 data = json.load(f)
-            # look for ring keypoints if present
             for obj in data:
                 kps = obj.get("keypoints", {})
                 rR = kps.get("ring_right", [0, 0, 0])
@@ -477,16 +553,28 @@ def main():
             return None
         return None
 
+    saved_count = 0
+    ann_count = 0
+
     for name in tqdm(tool_files, desc="Compositing"):
         tool_path = os.path.join(args.images, name)
         tool_rgba = Image.open(tool_path).convert("RGBA")
 
-        # Enforce expected frame size if supplied
+        # Enforce expected frame size if supplied (we keep tool untouched regardless)
         if forced_size and tool_rgba.size != forced_size:
-            # optional: warn but keep tool untouched
+            # optional: warn; we still use tool size as frame
             pass
 
-        # Choose & prep background to match the tool's full frame size
+        # --- FULL-SILHOUETTE RLE (pre-occlusion) ---
+        W, H = tool_rgba.size
+        M_id = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)  # identity warp
+        rle, mask_bin = rle_from_rgba(tool_rgba, M_id, W, H, thr=8)
+
+        img_id = next_img_id
+        cat_id = cat_id_from_filename(name)
+        ann = coco_ann_from_mask(rle, mask_bin, cat_id=cat_id, image_id=img_id, ann_id=next_ann_id)
+
+        # Prepare background to match full frame
         bg = Image.open(random.choice(bg_files)).convert("RGB")
         if forced_size:
             bg = resize_bg_to(bg, forced_size, mode=args.bg_fit)
@@ -497,16 +585,60 @@ def main():
         stem = numeric_stem(name)
         ring_xy = read_ring_kp(stem)
 
+        # Compose (hands/shadows added AFTER silhouette capture)
+        compose_fullframe._label_text = ("Needle Holder" if cat_id == 1 else "Tweezers") if args.add_text_labels else None
+        
         out = compose_fullframe(
             bg_rgb=bg,
-            tool_rgba=tool_rgba,           # not cropped, not resized, pasted at (0,0)
+            tool_rgba=tool_rgba,
             hand_pool=hand_pool,
             hand_prob=args.hand_prob,
             keypoint_xy=ring_xy,
             bg_fit_mode=args.bg_fit
         )
+        
+        compose_fullframe._label_text = None  # cleanup
 
-        out.save(os.path.join(out_dir, name), quality=95)
+        # Save composited image
+        out_path = os.path.join(out_dir, name)
+        out.save(out_path, quality=95)
+        saved_count += 1
+
+        # Always trust the saved image size
+        W, H = out.size
+
+        # COCO image entry (always add the image)
+        images_coco.append({
+            "id": img_id,
+            "file_name": name,  # or relpath if you prefer
+            "width": W,
+            "height": H
+        })
+        next_img_id += 1
+
+        # COCO annotation entry (only if mask not empty)
+        if ann is not None:
+            # ann["image_id"] must equal img_id from above (your code sets it earlier)
+            annotations_coco.append(ann)
+            next_ann_id += 1
+            ann_count += 1
+        else:
+            print(f"⚠️  No foreground pixels in {name}; added image without annotation.")
+
+
+    # Write COCO JSON
+    if args.coco_out:
+        coco = {
+            "images": images_coco,
+            "annotations": annotations_coco,
+            "categories": categories_coco
+        }
+        os.makedirs(os.path.dirname(args.coco_out) or ".", exist_ok=True)
+        with open(args.coco_out, "w") as f:
+            json.dump(coco, f, indent=2)
+        print(f"✅ Wrote COCO: {args.coco_out} ({len(images_coco)} images, {len(annotations_coco)} annotations)")
+
+    print(f"✅ Done. Saved {saved_count} images to: {out_dir}")
 
 if __name__ == "__main__":
     main()
