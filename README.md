@@ -45,7 +45,7 @@ CVS-Project-2D-Pose-Estimation/
 │   └── refined_weights.pt
 │
 ├── hands/
-│   └── hand_1.obj # right hand object
+│   └── hand_1.obj              # right hand object
 │
 ├── curate_and_split.py         # Curates and splits datasets into train/val
 ├── model_refine.py             # Fine-tunes pretrained model on pseudo-labeled real data
