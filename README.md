@@ -31,13 +31,6 @@ The system focuses on **tweezers** and **needle holders**, and aims to generaliz
 
 ```
 CVS-Project-2D-Pose-Estimation/
-├── curate_and_split.py         # Curates and splits datasets into train/val
-├── model_refine.py             # Fine-tunes pretrained model on pseudo-labeled real data
-├── predict.py                  # Inference on images
-├── synthetic_data_generator.py # Main entry point for synthetic dataset generation
-├── train.py                    # YOLO-style model training
-├── video.py                    # Inference and visualization on surgical videos
-│
 ├── data_generation/
 │   ├── annotations_to_coco.py
 │   ├── coco_to_yolo_seg.py
@@ -51,6 +44,15 @@ CVS-Project-2D-Pose-Estimation/
 │   ├── synthetic_weights.pt
 │   └── refined_weights.pt
 │
+├── hands/
+│   └── hand_1.obj # right hand object
+│
+├── curate_and_split.py         # Curates and splits datasets into train/val
+├── model_refine.py             # Fine-tunes pretrained model on pseudo-labeled real data
+├── predict.py                  # Inference on images
+├── synthetic_data_generator.py # Main entry point for synthetic dataset generation
+├── train.py                    # YOLO-style model training
+├── video.py                    # Inference and visualization on surgical videos
 ├── requirements.txt
 └── README.md
 ```
@@ -206,6 +208,18 @@ python refine.py \
 --epochs 50 --topup_epochs 12 \
 --self_train --self_min_conf_nh 0.55 --self_min_conf_t 0.45 \
 --imgsz 1536 --device 0 --project seg_phaseB --name refined_seg 
+```
+
+#### Step 4 - Inference
+just replace the seg_phaseB subfolder to your refines model
+```bash
+python video.py \
+--weights /home/student/project/seg_phaseB/refined_seg_topup/weights/best.pt \
+--video /datashare/project/vids_test/4_2_24_A_1_small.mp4 \
+--out_dir out_vis/final_pred \
+--imgsz 1536 --conf 0.35 --iou 0.55 --device 0 --max_det 8 \
+--retina_masks --draw_kpts --progress_every 1 \
+--pre_clahe --clahe_clip 2.0
 ```
 
 ---
