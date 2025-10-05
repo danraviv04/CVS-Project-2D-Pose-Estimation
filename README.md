@@ -184,7 +184,7 @@ Refine the model using unlabeled real videos via **self-training (pseudo-labelin
 ### Reproduce
 
 #### Step 1 — Generate Pseudo-Labels
-for that you can use the Evaluation `video.py` call used in the Evaluation from the phase above (make sure to use it on the `vids_tune/4_2_24_B_2.mp4` and `vids_tune/20_2_24_1.mp4` videos)
+You can use the Evaluation `video.py` call used in the Evaluation from the phase above (make sure to use it on the `vids_tune/4_2_24_B_2.mp4` and `vids_tune/20_2_24_1.mp4` videos)
 
 #### Step 2 — Curate and create the pseudo-labels' dataset
 clean the predictions and take the best ones
