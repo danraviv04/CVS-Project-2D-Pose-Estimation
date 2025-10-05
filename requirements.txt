@@ -116,10 +116,10 @@ cloudpickle==3.1.1
 colorama @ file:///home/conda/feedstock_root/build_artifacts/colorama_1733218098505/work
 coloredlogs==15.0.1
 comm @ file:///croot/comm_1709322850197/work
-contourpy @ file:///croot/contourpy_1732540045555/work
+contourpy==1.3.2
 cramjam==2.10.0
 cryptography==44.0.3
-cycler @ file:///tmp/build/80754af9/cycler_1637851556182/work
+cycler==0.12.1
 Cython @ file:///croot/cython_1736260275371/work
 dask==2021.1.0
 databricks-cli==0.18.0
@@ -134,6 +134,7 @@ dlib @ file:///home/conda/feedstock_root/build_artifacts/dlib_1652035089999/work
 docker==7.1.0
 dotnetcore2==3.1.23
 entrypoints==0.4
+eval_type_backport==0.2.2
 exceptiongroup @ file:///croot/exceptiongroup_1706031385326/work
 executing @ file:///opt/conda/conda-bld/executing_1646925071911/work
 fastapi==0.115.12
@@ -144,11 +145,10 @@ fire==0.7.0
 fixedint==0.1.6
 Flask==3.1.0
 flatbuffers==25.2.10
-fonttools @ file:///croot/fonttools_1737039080035/work
+fonttools==4.60.0
 fqdn==1.5.1
 fsspec==2025.3.2
 future==1.0.0
-gensim==4.3.3
 gitdb @ file:///home/conda/feedstock_root/build_artifacts/gitdb_1735887193964/work
 GitPython @ file:///home/conda/feedstock_root/build_artifacts/gitpython_1735929639977/work
 google-api-core==2.24.2
@@ -210,7 +210,7 @@ jupyterlab_server @ file:///croot/jupyterlab_server_1725865349919/work
 jupyterlab_widgets @ file:///croot/jupyterlab_widgets_1733440870459/work
 keras==3.9.2
 keras2onnx==1.7.0
-kiwisolver @ file:///croot/kiwisolver_1737039087198/work
+kiwisolver==1.4.9
 krb5==0.7.1
 lazy_loader @ file:///croot/lazy_loader_1718176737906/work
 lightgbm==2.3.0
@@ -221,7 +221,7 @@ Markdown==3.8
 markdown-it-py==3.0.0
 MarkupSafe==3.0.2
 marshmallow==3.26.1
-matplotlib @ file:///croot/matplotlib-suite_1713336378214/work
+matplotlib==3.7.5
 matplotlib-inline @ file:///opt/conda/conda-bld/matplotlib-inline_1662014470464/work
 mdurl==0.1.2
 mistune @ file:///croot/mistune_1741124011532/work
@@ -250,7 +250,7 @@ nltk==3.9.1
 notebook @ file:///croot/notebook_1738159946465/work
 notebook_shim @ file:///croot/notebook-shim_1741707758683/work
 numexpr @ file:///croot/numexpr_1730215937391/work
-numpy==1.23.5
+numpy==1.26.4
 nvidia-cublas-cu12==12.1.3.1
 nvidia-cuda-cupti-cu12==12.1.105
 nvidia-cuda-nvrtc-cu12==12.1.105
@@ -275,6 +275,7 @@ opencensus-ext-azure==1.1.14
 opencensus-ext-logging==0.1.1
 opencv-contrib-python==4.11.0.86
 opencv-python==4.11.0.86
+opencv-python-headless==4.9.0.80
 opentelemetry-api==1.31.1
 opentelemetry-instrumentation==0.52b1
 opentelemetry-instrumentation-asgi==0.52b1
@@ -293,14 +294,14 @@ opentelemetry-semantic-conventions==0.52b1
 opentelemetry-util-http==0.52b1
 optree==0.15.0
 overrides @ file:///croot/overrides_1699371140756/work
-packaging @ file:///croot/packaging_1734472117206/work
+packaging==25.0
 pandas @ file:///croot/pandas_1732735089971/work/dist/pandas-2.2.3-cp310-cp310-linux_x86_64.whl#sha256=3fa290e76efa7b7868273de6ab4ee4a73af177cdd88202834ad0eea6dd898d9e
 pandocfilters @ file:///opt/conda/conda-bld/pandocfilters_1643405455980/work
 parso @ file:///croot/parso_1733963305961/work
 partd==1.4.2
 PasteDeploy==3.1.0
 pexpect @ file:///tmp/build/80754af9/pexpect_1605563209008/work
-pillow @ file:///croot/pillow_1744613067434/work
+pillow==11.3.0
 plaster==1.1.2
 plaster-pastedeploy==1.0.1
 platformdirs @ file:///croot/platformdirs_1744273042065/work
@@ -319,6 +320,7 @@ py4j==0.10.9.9
 pyarrow==19.0.1
 pyasn1==0.6.1
 pyasn1_modules==0.4.2
+pycocotools==2.0.10
 pycparser @ file:///tmp/build/80754af9/pycparser_1636541352034/work
 pydantic==2.11.4
 pydantic_core==2.33.2
@@ -326,13 +328,13 @@ pydash==8.0.5
 Pygments @ file:///croot/pygments_1744664109463/work
 PyJWT==2.10.1
 pyOpenSSL==25.0.0
-pyparsing @ file:///opt/conda/conda-bld/pyparsing_1661452539315/work
+pyparsing==3.2.5
 PyQt6==6.7.1
 PyQt6_sip @ file:///croot/pyqt-split_1744804475988/work/pyqt_sip
 pyramid==2.0.2
 PySocks @ file:///home/builder/ci_310/pysocks_1640793678128/work
 pyspnego==0.11.2
-python-dateutil @ file:///croot/python-dateutil_1716495738603/work
+python-dateutil==2.9.0.post0
 python-json-logger @ file:///croot/python-json-logger_1734370021104/work
 pytz @ file:///croot/pytz_1713974312559/work
 PyYAML @ file:///croot/pyyaml_1728657952215/work
@@ -354,8 +356,10 @@ scikit-image @ file:///croot/scikit-image_1737476515437/work
 scikit-learn @ file:///croot/scikit-learn_1737988764076/work
 scipy==1.13.1
 Send2Trash @ file:///croot/send2trash_1736540790175/work
+sentencepiece==0.2.1
+simsimd==6.5.3
 sip @ file:///croot/sip_1738856193618/work
-six @ file:///croot/six_1744271502820/work
+six==1.17.0
 skl2onnx==1.18.0
 smart-open==7.1.0
 smmap @ file:///home/conda/feedstock_root/build_artifacts/smmap_1739781697784/work
@@ -368,6 +372,7 @@ sqlparse==0.5.3
 stack-data @ file:///opt/conda/conda-bld/stack_data_1646927590127/work
 starlette==0.46.2
 strictyaml==1.7.3
+stringzilla==4.0.14
 sympy==1.14.0
 tabulate==0.9.0
 tblib==3.1.0
@@ -384,7 +389,6 @@ toolz==1.0.0
 torch==2.5.1+cu121
 torch-tb-profiler==0.4.3
 torchaudio==2.5.1+cu121
-torchtext==0.6.0
 torchvision==0.20.1+cu121
 tornado @ file:///croot/tornado_1733960490606/work
 tqdm @ file:///croot/tqdm_1738943501192/work
