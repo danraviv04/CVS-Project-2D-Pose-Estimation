@@ -592,30 +592,6 @@ def main():
     ap.add_argument("--write_pose", action="store_true")
     ap.add_argument("--pose_out", type=str, default="/home/student/project/output/yolo_data")
     ap.add_argument("--pose_copy_images", action="store_true")
-    
-    """
-    python train.py \
-    --data /home/student/project/output/yolo_data_seg/data.yaml \
-    --model yolo11s-seg.pt \
-    --epochs 90 --imgsz 1536 --batch -1 --device 0 \
-    --project seg_phaseB --name yolo11s_seg_or_aug_2super_orheavy \
-    --warmup_epochs 3 --base_strength 0.70 --max_strength 1.20 --clahe_clip 2.0 \
-    --derive_on none --derive_imgsz 1536 --derive_iou 0.55 \
-    --scales 1.25,1.0 --conf_ladder 0.36,0.32,0.28
-
-    
-    python train.py \
-    --data /home/student/project/output/yolo_data_seg/data.yaml \
-    --model yolo11m-seg.pt \
-    --epochs 75 --imgsz 1408 --batch -1 --device 0 \
-    --project seg_phaseB --name yolo11m_seg_or_aug_medium \
-    --warmup_epochs 4 --base_strength 0.60 --max_strength 1.00 --clahe_clip 2.0 \
-    --derive_on none --derive_imgsz 1408 --derive_iou 0.55 \
-    --scales 1.25,1.0 --conf_ladder 0.36,0.32,0.28
-    
-    
-    1536\ 1408\ 1280
-    """
 
     args = ap.parse_args()
     set_seed_all(0)
@@ -643,6 +619,7 @@ def main():
         erasing=0.14,
         workers=8, cache=True
     )
+    
 
     # ---- Reload best & derive KP from polygons with union-NMS ----
     best = Path(model.trainer.save_dir) / "weights" / "best.pt"

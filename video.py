@@ -401,10 +401,10 @@ def main():
     avg_fps = (idx / max(1e-6, total_elapsed))
     print(f"✅ Output saved to: {out_path}")
     if args.save_txt:
-        print(f"📝 Per-frame labels → {lab_dir}")
+        print(f"Per-frame labels → {lab_dir}")
     if args.save_frames:
-        print(f"🖼  Per-frame images → {img_dir}")
-    print(f"📊 Done: frames={idx} | elapsed={_fmt_secs(total_elapsed)} | avg_fps={avg_fps:.1f} | NH={nh_total} T={t_total}")
+        print(f"Per-frame images → {img_dir}")
+    print(f"Done: frames={idx} | elapsed={_fmt_secs(total_elapsed)} | avg_fps={avg_fps:.1f} | NH={nh_total} T={t_total}")
 
 if __name__ == "__main__":
     main()
