@@ -43,14 +43,14 @@ annotation_id = 1
 
 for file in tqdm(sorted(os.listdir(KEYPOINT_JSON_DIR))):
     if not file.endswith(".json"):
-        print(f"⚠️ Skipping non-JSON file: {file}")
+        print(f"Skipping non-JSON file: {file}")
         continue
 
     name = os.path.splitext(file)[0]
     image_file = f"{name}.png"
     image_path = os.path.join(IMAGE_DIR, image_file)
     if not os.path.exists(image_path):
-        print(f"⚠️ Image file not found: {image_file}, skipping...")
+        print(f"Image file not found: {image_file}, skipping...")
         continue
 
     # Add image entry
@@ -69,7 +69,7 @@ for file in tqdm(sorted(os.listdir(KEYPOINT_JSON_DIR))):
         keypoint_dict = tool["keypoints"]
         tool_class = 1 if tool["name"].lower().startswith("nh") else 2
         if tool_class not in [1, 2]:
-            print(f"⚠️ Unknown tool class {tool_class} in {file}, skipping...")
+            print(f"Unknown tool class {tool_class} in {file}, skipping...")
             continue  # skip unknown
 
         keypoints_flat = []

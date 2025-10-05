@@ -37,9 +37,9 @@ def draw_label_on_top(img_rgba, text, xy, fg=(255,255,255), bg=(0,0,0), pad=2):
 def rle_from_rgba(tool_rgba, M, out_w, out_h, thr=8):
     """
     tool_rgba: PIL.Image RGBA of the tool BEFORE occluders
-    M: 2x3 affine you used to place the tool (same rotation/scale/shift)
-    out_w, out_h: canvas size
-    thr: alpha threshold (0-255) to consider as foreground
+        M: 2x3 affine you used to place the tool (same rotation/scale/shift)
+        out_w, out_h: canvas size
+        thr: alpha threshold (0-255) to consider as foreground
     returns: (rle_dict, mask_bin) where rle_dict has ascii 'counts'
     """
     # 1) alpha -> binary mask
@@ -68,6 +68,14 @@ def rle_from_rgba(tool_rgba, M, out_w, out_h, thr=8):
     return rle, mask_warp
 
 def coco_ann_from_mask(rle, mask_bin, cat_id, image_id, ann_id):
+    """
+    rle: RLE dict from rle_from_rgba()
+        mask_bin: binary HxW uint8 mask (0/1) corresponding to rle
+        cat_id: int, COCO category id
+        image_id: int, COCO image id
+        ann_id: int, COCO annotation id
+    returns: COCO annotation dict, or None if mask is empty
+    """
     ys, xs = np.where(mask_bin > 0)
     if ys.size == 0 or xs.size == 0:
         # empty mask -> caller should handle (we'll return None)
@@ -89,6 +97,14 @@ def coco_ann_from_mask(rle, mask_bin, cat_id, image_id, ann_id):
 HOTSPOT_PROB = 0.10
 
 def make_dir_light_mask(size, direction=(0, -1), hard=1.25):
+    """
+    2D directional light ramp for relighting.
+        size: (w, h)
+        direction: (x, y) light direction vector (should be normalized)
+        hard: float, higher = sharper light transition
+    returns: PIL.Image L, light ramp in [0,255]
+    """
+    
     w, h = size
     v = np.array(direction, np.float32); v /= (np.linalg.norm(v) + 1e-6)
     xs = (np.arange(w, dtype=np.float32) - w / 2.0)[None, :]
@@ -99,6 +115,13 @@ def make_dir_light_mask(size, direction=(0, -1), hard=1.25):
     return Image.fromarray((dot * 255).astype(np.uint8))
 
 def estimate_bg_stats(bg_rgb_img, alpha01):
+    """
+    Estimate background luminance and tint from visible areas.
+        bg_rgb_img: PIL.Image RGB background
+        alpha01: HxW float mask in [0,1] where tool is present
+    returns: (L_bg, tint_bg) where L_bg is float luminance, tint_bg is [r,g,b] mean color
+    """
+    
     bg_np = np.asarray(bg_rgb_img, np.float32) / 255.0
     inv = (alpha01 < 0.01)
     region = bg_np[inv] if inv.any() else bg_np.reshape(-1, 3)
@@ -108,6 +131,15 @@ def estimate_bg_stats(bg_rgb_img, alpha01):
 
 def relight_tool_fullframe(tool_rgba, light_dir=(0, -1), strength=0.35,
                            contrast_boost=1.08, bg_stats=None):
+    """
+    Relight the tool image using a directional light ramp and optional background stats.
+        tool_rgba: PIL.Image RGBA of the tool
+        light_dir: (x, y) light direction vector (should be normalized)
+        strength: float, relight strength
+        contrast_boost: float, contrast enhancement after relight
+        bg_stats: (L_bg, tint_bg) from estimate_bg_stats(), or None to skip
+    returns: PIL.Image RGBA of relit tool (same size as input)
+    """
     tool_rgba = tool_rgba.convert("RGBA")
     rgb, a = tool_rgba.convert("RGB"), tool_rgba.split()[-1]
 
@@ -138,6 +170,12 @@ def relight_tool_fullframe(tool_rgba, light_dir=(0, -1), strength=0.35,
     return Image.merge("RGBA", (*rgb_lit.split(), a))
 
 def add_grain(rgb, amount=0.015):
+    """
+    Add subtle Gaussian noise to an RGB image.
+        rgb: PIL.Image RGB
+        amount: float, noise standard deviation
+    returns: PIL.Image RGB with noise added
+    """
     arr = np.asarray(rgb, np.float32) / 255.0
     noise = np.random.normal(0, amount, arr.shape).astype(np.float32)
     out = np.clip(arr + noise, 0, 1)
@@ -187,6 +225,11 @@ def add_shadow(bg_rgba, tool_rgba, pos=(0, 0), light_dir=(0, -1),
 # ----------------- hotspot -----------------
 
 def _as_float_mask01(mask):
+    """
+    Convert a PIL or numpy mask to a float32 HxW array in [0,1].
+        mask: PIL.Image or np.ndarray
+    returns: np.ndarray HxW float32 in [0,1]
+    """
     # PIL or np -> float HxW in [0,1]
     if isinstance(mask, Image.Image):
         arr = np.asarray(mask)
@@ -209,6 +252,12 @@ def _as_float_mask01(mask):
     return np.clip(arr, 0.0, 1.0)
 
 def _to_pil_L(x):
+    """
+    Convert a PIL or numpy array to a PIL.Image L (8-bit grayscale).
+        x: PIL.Image or np.ndarray
+    returns: PIL.Image L
+    """
+    
     if isinstance(x, Image.Image):
         return x if x.mode == "L" else x.convert("L")
     a = np.asarray(x)
@@ -225,6 +274,18 @@ def _pil_gauss(x, sigma):
 
 def add_spot_hotspot(bg_rgb_img, alpha_mask01, intensity=None,
                      minmax=(0.02, 0.08), outside_only=True, match_bg=True):
+    
+    """
+    Add a subtle bright spot around the tool using its alpha mask.
+        bg_rgb_img: PIL.Image RGB background
+        alpha_mask01: HxW float mask in [0,1] where tool is present (or None to skip)
+        intensity: float or None, fixed intensity for the spot (overrides minmax)
+        minmax: (min, max) range of random intensity if intensity is None
+        outside_only: bool, whether to restrict spot to outside tool area
+        match_bg: bool, whether to adjust spot brightness based on local bg
+    returns: PIL.Image RGB with spot added
+    """
+    
     if alpha_mask01 is None:
         return bg_rgb_img
     alpha = _as_float_mask01(alpha_mask01)
@@ -267,6 +328,10 @@ def add_spot_hotspot(bg_rgb_img, alpha_mask01, intensity=None,
 # ----------------- 2D hand overlay -----------------
 
 def load_hand_pool(hands_dir):
+    """
+    Load all hand cutouts from a directory.
+        hands_dir: str, directory containing hand images (PNG/WebP with alpha)
+    """
     if not hands_dir or not os.path.isdir(hands_dir):
         return []
     exts = (".png", ".webp")
@@ -282,6 +347,7 @@ def load_hand_pool(hands_dir):
     return pool
 
 def augment_hand(im, rot_deg_range=(-25, 25), blur_prob=0.3, brighten=(0.9, 1.1), jpeg_prob=0.3):
+    """Random augmentations for hand cutouts."""
     if random.random() < 0.5:
         im = ImageOps.mirror(im)
     im = im.rotate(random.uniform(*rot_deg_range), resample=Image.BICUBIC, expand=True)
@@ -301,6 +367,16 @@ def augment_hand(im, rot_deg_range=(-25, 25), blur_prob=0.3, brighten=(0.9, 1.1)
 
 def place_hand(bg, hand_rgba, tool_bbox, side="auto",
                scale_range=(0.85, 1.15), overlap_frac=0.50):
+    """
+    Place a hand cutout near the tool bbox on the background.
+        bg: PIL.Image RGBA background
+        hand_rgba: PIL.Image RGBA of the hand cutout
+        tool_bbox: (x0, y0, x1, y1) bbox of the tool in the bg image
+        side: "left", "right", "top", "bottom", or "auto" to choose randomly
+        scale_range: (min, max) range to scale hand height relative to tool height
+        overlap_frac: fraction of hand width/height to overlap with tool bbox
+    returns: PIL.Image RGBA with hand composited
+    """
     x0, y0, x1, y1 = tool_bbox
     tw, th = x1 - x0, y1 - y0
     if tw <= 0 or th <= 0:
@@ -334,6 +410,11 @@ def place_hand(bg, hand_rgba, tool_bbox, side="auto",
 # ----------------- background helpers -----------------
 
 def numeric_stem(name: str) -> str:
+    """
+    Extract numeric stem from filename for sorting.
+        name: str, filename
+    returns: numeric part of stem or full stem if no digits
+    """
     stem = os.path.splitext(os.path.basename(name))[0]
     m = re.search(r"\d+", stem)
     return m.group(0) if m else stem
@@ -362,6 +443,7 @@ def resize_bg_to(bg_rgb, target_size, mode="cover"):
     return scaled.crop((x0, y0, x0 + W, y0 + H))
 
 def feather_rgba(im, r=1.0):
+    """Feather the alpha channel of an RGBA image."""
     r_, g_, b_, a_ = im.split()
     size = max(3, int(2 * max(0.1, r)) | 1)  # odd kernel ≥3
     a_ = a_.filter(ImageFilter.MaxFilter(size)).filter(ImageFilter.GaussianBlur(0.6 * r))
@@ -623,7 +705,7 @@ def main():
             next_ann_id += 1
             ann_count += 1
         else:
-            print(f"⚠️  No foreground pixels in {name}; added image without annotation.")
+            print(f"No foreground pixels in {name}; added image without annotation.")
 
 
     # Write COCO JSON

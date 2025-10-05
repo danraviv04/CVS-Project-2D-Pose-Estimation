@@ -123,6 +123,13 @@ def short_from_category(name: str) -> str:
 
 
 def label_for_ann(ann, cats_by_id, mode="category"):
+    """
+    Get a label string for an annotation.
+        ann: COCO annotation dict
+        cats_by_id: dict mapping category_id to category dict
+        mode: "category" (full name), "short" (NH/T), or "instance" (instance name)
+    returns: label string
+    """
     cname = (cats_by_id.get(ann["category_id"], {}) or {}).get("name", "")
     iname = ann.get("attributes", {}).get("name", "") or ann.get("name", "")
 
@@ -189,7 +196,7 @@ def main():
         if not src.exists():
             src = Path(args.images_root) / Path(im_info["file_name"])
         if not src.exists():
-            print(f"⚠️ missing image for {im_info['file_name']}")
+            print(f"missing image for {im_info['file_name']}")
             continue
 
         # Fallback if width/height missing in COCO

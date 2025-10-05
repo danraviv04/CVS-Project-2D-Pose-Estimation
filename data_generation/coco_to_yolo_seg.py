@@ -8,10 +8,22 @@ CAT_TO_YOLO = {1: 0, 2: 1}
 NAMES = ["needle_holder", "tweezers"]
 
 def poly_area(pl):
+    """
+    Compute the area of a polygon given its vertices.
+        pl: list of [x1, y1, x2, y2, ..., xn, yn]
+    return: area (float)
+    """ 
     x = pl[0::2]; y = pl[1::2]
     return 0.5 * abs(sum(x[i]*y[(i+1)%len(y)] - x[(i+1)%len(x)]*y[i] for i in range(len(x))))
 
 def write_yaml(root, train, val, names):
+    """
+    Write a YOLO data.yaml file.
+        root: Path, output directory
+        train: str, path to training images relative to root
+        val: str, path to validation images relative to root
+        names: list of class names
+    """
     text = (
         f"path: {Path(root).resolve()}\n"
         f"train: {train}\n"

@@ -13,10 +13,20 @@ KP_ORDER = [
 COCO2YOLO = {1: 0, 2: 1}  # 1=needle_holder -> NH(0), 2=tweezers -> T(1)
 
 def short_name(cat_or_inst: str) -> str:
+    """
+    Convert category or instance name to short form.
+        cat_or_inst: str, category or instance name
+    return: "NH" for Needle Holder, "T" for Tweezers
+    """
+    
     s = (cat_or_inst or "").lower()
     return "Needle Holder" if ("needle" in s or s.startswith("nh")) else "Tweezwers"
 
 def write_yaml(yolo_root: Path):
+    """
+    Write a YOLO-Pose data.yaml file.
+        yolo_root: Path, output directory for YOLO-Pose dataset
+    """
     yaml = yolo_root / "data.yaml"
     (yolo_root / "images/train").mkdir(parents=True, exist_ok=True)
     (yolo_root / "images/val").mkdir(parents=True, exist_ok=True)
@@ -36,6 +46,12 @@ def write_yaml(yolo_root: Path):
             f.write(f"  - [{i}, {i+1}]\n")
 
 def make_split(split: str, root: Path, link: bool):
+    """
+    Create a YOLO-Pose dataset split (train or val).
+        split: str, "train" or "val"
+        root: Path, root directory containing coco_data/, composited/, keypoints/
+        link: bool, whether to use symlinks for images instead of copies
+    """
     coco = json.loads((root / "coco_data" / f"annotations_{split}.json").read_text())
     kproot = root / "keypoints"
     src_img_root = root / "composited" / split
@@ -53,7 +69,7 @@ def make_split(split: str, root: Path, link: bool):
         src = src_img_root / Path(im["file_name"]).name
         dst = img_out / src.name
         if not src.exists():
-            print(f"⚠️  missing image: {src}")
+            print(f"missing image: {src}")
             continue
         if link:
             try:

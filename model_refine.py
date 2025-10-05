@@ -58,6 +58,14 @@ def kind_from_name(name: str) -> str:
 
 # ---------------- Safe polygon utils (letterbox/version tolerant)
 def regularize_poly(pts: np.ndarray, eps_frac=0.003, max_pts=150) -> np.ndarray:
+    """
+    Simplify and regularize a polygon.
+    -   pts: Nx2 float32 array of (x,y) points
+    -   eps_frac: fraction of perimeter to use as epsilon for approxPolyDP
+    -   max_pts: maximum number of points to keep (downsample if needed)
+    
+    Return: Mx2 float32 array of (x,y) points, or None if
+    """
     if pts is None or len(pts) < 3: return pts
     peri = cv2.arcLength(pts.reshape(-1,1,2).astype(np.float32), True)
     eps  = max(0.8, eps_frac * peri)
@@ -71,6 +79,15 @@ def regularize_poly(pts: np.ndarray, eps_frac=0.003, max_pts=150) -> np.ndarray:
     return np.asarray(out, np.float32)
 
 def poly_in_frame(res, i_det: int, W0: int, H0: int) -> Optional[np.ndarray]:
+    """
+    Extract and regularize polygon for the i_det-th detection in res,
+    scaled to original frame size W0 x H0.
+    Try in order:
+        - normalized polys (res.masks.xyn)
+        - absolute polys (res.masks.xy)
+        - bitmap fallback (res.masks.data)
+    Return: Nx2 float32 array of (x,y) points, or None if failed
+    """
     try:  # normalized polys
         parts = res.masks.xyn[i_det]; parts = parts if isinstance(parts, list) else [parts]
         Hs, Ws = res.orig_shape; sx, sy = W0/float(Ws), H0/float(Hs)
@@ -94,6 +111,14 @@ def poly_in_frame(res, i_det: int, W0: int, H0: int) -> Optional[np.ndarray]:
         return None
 
 def box_in_frame(res, i_det: int, W0: int, H0: int) -> List[float]:
+    """
+    Extract bounding box for the i_det-th detection in res,
+    scaled to original frame size W0 x H0.
+    Try in order:
+        - normalized box (res.boxes.xyxyn)
+        - absolute box (res.boxes.xyxy)
+    Return: [x1,y1,x2,y2] as float list
+    """
     try:
         x1n,y1n,x2n,y2n = res.boxes.xyxyn[i_det]
         return [float(x1n*W0), float(y1n*H0), float(x2n*W0), float(y2n*H0)]
@@ -104,12 +129,21 @@ def box_in_frame(res, i_det: int, W0: int, H0: int) -> List[float]:
     return [x1*sx, y1*sy, x2*sx, y2*sy]
 
 def iou_xyxy(a,b):
+    """
+    IoU of two boxes a and b, each as [x1,y1,x2,y2]
+    """
     ax1,ay1,ax2,ay2=a; bx1,by1,bx2,by2=b
     iw=max(0.0,min(ax2,bx2)-max(ax1,bx1)); ih=max(0.0,min(ay2,by2)-max(ay1,by1))
     inter=iw*ih; ua=(ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-inter
     return inter/ua if ua>0 else 0.0
 
 def nms_union(items, thr=0.6):
+    """
+    Non-maximum suppression by union-find style grouping.
+    items: list of dict with keys "cls", "conf", "poly", "xyxy"
+    thr: IoU threshold to consider as overlapping
+    Return: subset of items to keep
+    """
     keep=[]
     items=sorted(items, key=lambda x:x["conf"], reverse=True)
     for it in items:
@@ -134,6 +168,21 @@ def harvest_labels(model: YOLO, images_dir: Path, labels_dir: Path,
                    imgsz: int, iou: float,
                    scales=(1.25,1.0), confs=(0.36,0.32,0.28),
                    min_conf_nh=0.55, min_conf_t=0.45):
+    
+    """
+    Predict and write fresh seg labels for all images in images_dir,
+    into labels_dir (which will be created if not exist).
+    - model: YOLO model (pretrained weights)
+    - images_dir: Path to images dir
+    - labels_dir: Path to output labels dir
+    - imgsz: inference image size (int)
+    - iou: NMS IoU threshold (float)
+    - scales: tuple of scales to try (e.g., (1.25,1.0))
+    - confs: tuple of confidence thresholds to try (e.g., (0.36,0.32,0.28))
+    - min_conf_nh: minimum confidence to keep NH (float)
+    - min_conf_t: minimum confidence to keep T (float)
+    """
+    
     labels_dir.mkdir(parents=True, exist_ok=True)
     raw_names = model.model.names
     names_map = ({int(k):v for k,v in raw_names.items()} if isinstance(raw_names, dict)

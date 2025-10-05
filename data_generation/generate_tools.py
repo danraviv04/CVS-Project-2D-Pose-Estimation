@@ -21,6 +21,11 @@ from mathutils.bvhtree import BVHTree
 
 # ---------- calibration helpers ----------
 def _bbox_from_proj(obj, proj, W, H):
+    """
+    Compute 2D bbox of the projected vertices of an object.
+    Return [x0,y0,x1,y1] in pixel coordinates, or [0,0,0,0] if not visible.
+    """
+    
     M = np.asarray(obj.get_local2world_mat(), dtype=float)
     xs, ys = [], []
     for v in obj.get_mesh().vertices:
@@ -35,6 +40,10 @@ def _bbox_from_proj(obj, proj, W, H):
     return [float(x0), float(y0), float(x1), float(y1)]
 
 def _bbox_from_mask(mask):
+    """
+    Compute 2D bbox from a binary mask.
+    Return [x0,y0,x1,y1] in pixel coordinates, or [0,0,0,0] if empty.
+    """
     ys, xs = np.where(mask > 0)
     if len(xs) == 0:
         return [0,0,0,0]
@@ -100,6 +109,7 @@ def shift_projector(proj, dx, dy):
 # Kind detection by filename (NH*.* -> needle holder, T*.* -> tweezers)
 # =========================================================
 def _detect_kind(tool_name: str) -> str:
+    """Detect tool kind from filename or folder name."""
     name = os.path.basename(tool_name).lower()
     if name.startswith("nh") or "needle" in name:
         return "NH"
@@ -115,6 +125,7 @@ def _detect_kind(tool_name: str) -> str:
 # Node helpers
 # =========================
 def _get_input(node, *names):
+    """Get the first matching input socket from names."""
     for n in names:
         s = node.inputs.get(n)
         if s is not None:
@@ -122,6 +133,7 @@ def _get_input(node, *names):
     return None
 
 def _set_input(node, value, *names):
+    """Set the default value of the first matching input socket from names."""
     s = _get_input(node, *names)
     if s is not None:
         s.default_value = value
@@ -130,6 +142,11 @@ def _set_input(node, value, *names):
 # Shading utilities
 # =========================
 def _shade_smooth(obj_bpy, angle_deg=60.0):
+    """
+    Apply smooth shading to a mesh object, with auto-smooth or edge-split.
+    angle_deg: angle threshold in degrees for auto-smooth or edge-split
+    """
+    
     if not obj_bpy or obj_bpy.type != 'MESH':
         return
     me = obj_bpy.data
@@ -179,6 +196,11 @@ def _shade_smooth(obj_bpy, angle_deg=60.0):
         pass
 
 def ensure_glove_material(name="GloveSSS", tint=(1.0, 1.0, 1.0)):
+    """
+    Create or update a subsurface scattering material for surgical gloves.
+    tint: RGB tuple for the glove color (default white)
+    """
+    
     mat = bpy.data.materials.get(name)
     if mat is None:
         mat = bpy.data.materials.new(name)
@@ -256,6 +278,11 @@ def ensure_glove_material(name="GloveSSS", tint=(1.0, 1.0, 1.0)):
     return mat
 
 def apply_glove_shader(hand_bproc_obj, tint=(1,1,1)):
+    """
+    Apply a subsurface scattering material for surgical gloves to a hand object.
+    tint: RGB tuple for the glove color (default white)
+    """
+    
     mat = ensure_glove_material(tint=tint)
     ob = hand_bproc_obj.blender_obj
     if len(ob.data.materials) == 0:
@@ -266,6 +293,10 @@ def apply_glove_shader(hand_bproc_obj, tint=(1,1,1)):
     _shade_smooth(ob)
 
 def ensure_surgical_metal(name="SurgicalSteel"):
+    """
+    Create or update a metallic material for surgical tools.
+    """
+    
     mat = bpy.data.materials.get(name)
     if mat is None:
         mat = bpy.data.materials.new(name)
@@ -335,6 +366,9 @@ def ensure_surgical_metal(name="SurgicalSteel"):
     return mat
 
 def apply_surgical_metal(tool_bproc_obj):
+    """
+    Apply a metallic material for surgical tools to a tool object.
+    """
     mat = ensure_surgical_metal()
     ob = tool_bproc_obj.blender_obj
     if len(ob.data.materials) == 0:
@@ -348,6 +382,12 @@ def apply_surgical_metal(tool_bproc_obj):
 # Wrist stub (short forearm)
 # =========================
 def _basis_from_z(z_world, up_hint=Vector((0,0,1))):
+    """
+    Construct a right-handed orthonormal basis matrix from a given z axis and an up hint.
+    z_world: Vector in world coordinates
+    up_hint: Vector in world coordinates to guide the y axis direction
+    """
+    
     z = z_world.normalized()
     x = up_hint.cross(z)
     if x.length < 1e-6:
@@ -463,6 +503,12 @@ UV_SHIFT_PIX = (0.0, 0.0)  # (du, dv) extra pixel shift if you want to nudge
 _BVH_CACHE = {}
 
 def _bvh_from_object(obj):
+    """
+    Build or retrieve from cache a BVH tree for raycasting against the object's mesh.
+    obj: bproc object
+    return: BVHTree
+    """
+    
     key = obj.blender_obj.as_pointer()
     if key in _BVH_CACHE:
         return _BVH_CACHE[key]
@@ -479,6 +525,12 @@ def _bvh_from_object(obj):
     return tree
 
 def _hand_world_centroid(hand):
+    """
+    Compute the centroid of the hand mesh in world coordinates.
+    hand: bproc object
+    return: Vector in world coordinates
+    """
+    
     H = np.asarray(hand.get_local2world_mat(), dtype=float)
     V = np.array([v.co[:] for v in hand.get_mesh().vertices], dtype=float)
     m = V.mean(0)
@@ -486,6 +538,18 @@ def _hand_world_centroid(hand):
     return Vector((float(w4[0]), float(w4[1]), float(w4[2])))
 
 def _nudge_to_surface(hand, tool, up, side, anchor, side_mm, lift_mm):
+    """
+    Nudge the hand along 'up' so that the palm (anchor + side*side_mm) is close to the tool surface.
+    hand: bproc object
+    tool: bproc object
+    up: Vector in world coordinates (palm normal)
+    side: Vector in world coordinates (thumb direction)
+    anchor: Vector in world coordinates (palm anchor point on tool shaft)
+    side_mm: float, offset along 'side' from anchor to palm center
+    lift_mm: float, initial offset along 'up' from anchor to palm center
+    return: True if successful, False if no surface found within 5cm
+    """
+    
     tree = _bvh_from_object(tool)
     starts = [
         anchor + side*side_mm + up*(lift_mm + 0.004),
@@ -506,6 +570,13 @@ def _nudge_to_surface(hand, tool, up, side, anchor, side_mm, lift_mm):
     return False
 
 def _stabilize_basis_with_local_axes(obj, fwd, up):
+    """
+    Adjust the given (fwd, up) vectors to be more aligned with the object's local axes.
+    obj: bproc object
+    fwd: Vector in world coordinates (desired forward direction)
+    up: Vector in world coordinates (desired up direction)
+    return: (fwd, up, side) orthonormal vectors in world coordinates
+    """
     Rw = obj.blender_obj.matrix_world.to_3x3()
     axes_local = [Vector((1,0,0)), Vector((0,1,0)), Vector((0,0,1))]
     axes_world = [ (Rw @ a).normalized() for a in axes_local ]
@@ -524,6 +595,12 @@ def _camera_forward(cam):
 # Base/tip + basis (stable)
 # =========================
 def _tool_axes_and_endpoints_world(obj, kind):
+    """
+    Compute a stable local basis and base/tip endpoints for the tool in world coordinates.
+    obj: bproc object
+    kind: "NH" or "T"
+    return: (shaft, up, side, base_w, tip_w, length, thickness)
+    """
     mesh = obj.get_mesh()
     V = np.array([v.co[:] for v in mesh.vertices], dtype=float)
     mean = V.mean(0)
@@ -603,10 +680,28 @@ def _tool_axes_and_endpoints_world(obj, kind):
 # Hand alignment
 # =========================
 def _proj_to_plane(v: Vector, n: Vector) -> Vector:
+    """
+    Project vector v onto the plane with normal n, and normalize the result.
+    v: Vector
+    n: Vector (should be normalized)
+    return: Vector
+    """
     return (v - n * v.dot(n)).normalized()
 
 def _roll_towards_camera(R3: Matrix, shaft: Vector, palm_local: Vector, cam,
                          max_deg=ROLL_MAX_DEG, bias_ccw_deg=0.0) -> Matrix:
+    
+    """
+    Adjust the roll of rotation matrix R3 around 'shaft' so that 'palm_local' points towards the camera.
+    R3: Matrix (3x3 rotation)
+    shaft: Vector in world coordinates (rotation axis)
+    palm_local: Vector in local hand coordinates (palm normal direction)
+    cam: bproc camera object
+    max_deg: float, maximum roll adjustment in degrees
+    bias_ccw_deg: float, additional counter-clockwise bias in degrees
+    return: Matrix (3x3 rotation)
+    """
+    
     cam_fwd = _camera_forward(cam)
     u_cur   = (R3 @ palm_local).normalized()
     a = _proj_to_plane(u_cur,    shaft)
@@ -619,6 +714,13 @@ def _roll_towards_camera(R3: Matrix, shaft: Vector, palm_local: Vector, cam,
     return Matrix.Rotation(phi, 3, shaft) @ R3
 
 def _compute_hand_scale(tool_len, hand_len, kind):
+    """
+    Compute a uniform scaling factor for the hand based on tool length and hand length.
+    tool_len: float, length of the tool in meters
+    hand_len: float, length of the hand in meters
+    kind: "NH" or "T"
+    return: float, scaling factor
+    """
     base_ratio = RATIO_NEEDLEHOLD if kind == "NH" else RATIO_TWEEZERS
     target_len = tool_len * base_ratio
     jitter = 1.0 + np.random.uniform(-RATIO_JITTER, RATIO_JITTER)
@@ -627,6 +729,15 @@ def _compute_hand_scale(tool_len, hand_len, kind):
     return float(np.clip(s, SCALE_MIN, SCALE_MAX))
 
 def _on_screen(obj, project_fn, W, H, margin=MARGIN):
+    """
+    Check if any vertex of the object projects within the screen bounds with a margin.
+        obj: bproc object
+        project_fn: function that takes a 3D point and returns (x, y, visibility)
+        W: int, image width in pixels
+        H: int, image height in pixels
+        margin: float, margin in normalized coordinates (0.0 to 0.5)
+    return: bool, True if any vertex is on screen within the margin
+    """
     W = int(W); H = int(H)
     if W <= 0 or H <= 0:
         return False
@@ -646,6 +757,17 @@ def _on_screen(obj, project_fn, W, H, margin=MARGIN):
     return False
 
 def _align_and_scale_hand_to_tool(hand, tool, kind, cam, project_fn, W, H):
+    """
+    Align, position, and scale the hand to grasp the tool appropriately.
+        hand: bproc object (hand)
+        tool: bproc object (tool)
+        kind: "NH" or "T"
+        cam: bproc camera object
+        project_fn: function that takes a 3D point and returns (x, y, visibility)
+        W: int, image width in pixels
+        H: int, image height in pixels
+    return: None (the hand object is modified in place)
+    """
     shaft, up0, side0, base_w, tip_w, length, thick = _tool_axes_and_endpoints_world(tool, kind)
 
     is_left = "left" in hand.blender_obj.name.lower()
@@ -715,6 +837,15 @@ def _align_and_scale_hand_to_tool(hand, tool, kind, cam, project_fn, W, H):
 # Projector (K + cam2world)
 # =========================
 def build_projector(K_3x3, cam2world_4x4, W, H, margin=MARGIN):
+    """
+    Build a projector function from camera intrinsics and extrinsics.
+        K_3x3: 3x3 camera intrinsic matrix
+        cam2world_4x4: 4x4 camera-to-world extrinsic matrix
+        W: int, image width in pixels
+        H: int, image height in pixels
+        margin: float, margin in normalized coordinates (0.0 to 0.5)
+    return: function that takes a 3D point and returns (x, y, visibility)
+    """
     K = np.asarray(K_3x3, dtype=np.float64)
     fx, fy = float(K[0, 0]), float(K[1, 1])
     cx, cy = float(K[0, 2]), float(K[1, 2])
@@ -776,6 +907,16 @@ def build_projector(K_3x3, cam2world_4x4, W, H, margin=MARGIN):
     return _proj
 
 def _bbox_norm_from_mesh(obj, project_fn, W, H, pad_ratio=0.02):
+    """
+    Compute a normalized bounding box [cx, cy, w, h] from the object's mesh projection.
+        obj: bproc object
+        project_fn: function that takes a 3D point and returns (x, y, visibility)
+        W: int, image width in pixels
+        H: int, image height in pixels
+        pad_ratio: float, padding ratio to add around the bbox
+    return: [cx, cy, w, h] in normalized coordinates (0.0 to 1.0)
+    """
+    
     M = np.asarray(obj.get_local2world_mat(), dtype=float)
     xs, ys = [], []
     for v in obj.get_mesh().vertices:
@@ -806,6 +947,15 @@ def _bbox_norm_from_mesh(obj, project_fn, W, H, pad_ratio=0.02):
 
 # --------- KEYPOINTS (CVS project schema) ---------
 def _tool_keypoints(tool_name, tool_obj, project_fn, W, H):
+    """
+    Detect keypoints on the tool and project them to 2D.
+        tool_name: str, name of the tool (used to detect kind)
+        tool_obj: bproc object (tool)
+        project_fn: function that takes a 3D point and returns (x, y, visibility)
+        W: int, image width in pixels
+        H: int, image height in pixels
+    return: dict of keypoints {name: [x, y, visibility]}
+    """
     kind = _detect_kind(tool_name)
 
     shaft, up, side, base_w, tip_w, length, thick = _tool_axes_and_endpoints_world(tool_obj, kind)
@@ -865,14 +1015,36 @@ def _tool_keypoints(tool_name, tool_obj, project_fn, W, H):
     return kps
 
 def build_point(pt_w, project_fn):
+    """
+    Build a 2D point from a 3D point using the project function.
+        pt_w: 3D point in world coordinates
+        project_fn: function that takes a 3D point and returns (x, y, visibility)
+    return: 2D point [x, y, visibility]
+    """
     x, y, vis = project_fn(pt_w)
     return [int(x), int(y), int(vis)]
 
 def _closest_point_on_line(vec, base, shaft_u):
+    """
+    Find the closest point on the line defined by base and shaft_u to the point vec.
+        vec: 3D point in world coordinates
+        base: base point of the line (3D)
+        shaft_u: direction vector of the line (3D)
+    return: closest point on the line (3D)
+    """
     t = np.dot(vec - base, shaft_u)
     return base + t * shaft_u
 
 def _ring_points_world(Vw, base_w, shaft, side_vec, length):
+    """
+    Find two points on the tool ring that are farthest from the shaft line.
+        Vw: Nx3 array of tool mesh vertices in world coordinates
+        base_w: base point of the tool in world coordinates
+        shaft: direction vector of the tool shaft in world coordinates
+        side_vec: side direction vector in world coordinates
+        length: length of the tool
+    return: (left_point, right_point) in world coordinates
+    """
     base = np.array([base_w.x, base_w.y, base_w.z], dtype=np.float32)
     shaft_u = np.array([shaft.x, shaft.y, shaft.z], dtype=np.float32)
     shaft_u /= (np.linalg.norm(shaft_u) + 1e-9)
@@ -913,7 +1085,18 @@ def _ring_points_world(Vw, base_w, shaft, side_vec, length):
 # Scene setup
 # =========================
 def _largest_mesh(objects):
+    """
+    Find the object with the largest bounding box diagonal among the given objects.
+        objects: list of bproc objects
+    return: bproc object with the largest bounding box diagonal
+    """
+
     def bbox_diag(o):
+        """
+            Compute the bounding box diagonal length of the object.
+                o: bproc object
+            return: float, bounding box diagonal length
+        """
         M = np.asarray(o.get_local2world_mat(), dtype=float)
         bb = [M @ np.array([c[0], c[1], c[2], 1.0]) for c in o.get_bound_box()]
         bb = np.array(bb)[:, :3]
@@ -921,6 +1104,12 @@ def _largest_mesh(objects):
     return max(objects, key=bbox_diag)
 
 def _mirror_mesh_inplace_x(obj):
+    """
+    Mirror the object's mesh in place along the X axis.
+        obj: bproc object
+    return: None (the object's mesh is modified in place)
+    """
+    
     bo = obj.blender_obj
     bo.data = bo.data.copy()
     bo.data.transform(Matrix.Scale(-1.0, 4, Vector((1, 0, 0))))
@@ -929,6 +1118,13 @@ def _mirror_mesh_inplace_x(obj):
     bpy.context.view_layer.update()
 
 def load_objects(tools_base_folder, right_hand_path):
+    """
+    Load needle holders, tweezers, and hand models from the specified paths.
+        tools_base_folder: str, path to the folder containing tool .obj files
+        right_hand_path: str, path to the right hand .obj file
+    return: (needle_holders, tweezers, right_hand, left_hand)
+    """
+    
     nh_files = sorted(glob.glob(os.path.join(tools_base_folder, "needle_holder", "*.obj")))
     tw_files = sorted(glob.glob(os.path.join(tools_base_folder, "tweezers", "*.obj")))
     needle_holders, tweezers = [], []
@@ -1017,6 +1213,12 @@ def set_frame_positions(needle_holders, tweezers, right_hand, left_hand, cam, pr
 # Lighting
 # =========================
 def _image_stats(img_path):
+    """
+    Compute luminance and average color of the image, ignoring extreme 5% pixels.
+        img_path: str, path to the image file
+    return: (luminance, [r, g, b]) where luminance is float and [r, g, b] is average color
+    """
+    
     from PIL import Image
     im = Image.open(img_path).convert("RGB")
     arr = np.asarray(im, dtype=np.float32) / 255.0
@@ -1028,8 +1230,14 @@ def _image_stats(img_path):
     return float(L[mask].mean()), arr[mask].mean(0)
 
 def setup_natural_hdr_lighting(hdr_files, bg_image_path=None):
+    """
+    Setup natural lighting using a random HDRI and 3-point lights.
+        hdr_files: list of str, paths to HDRI files
+        bg_image_path: str or None, path to background image for luminance estimation
+    return: dict with lighting info
+    """
     hdr = random.choice(hdr_files)
-    print(f"🌅 HDRI: {hdr}")
+    print(f"HDRI: {hdr}")
 
     world = bpy.context.scene.world
     world.use_nodes = True
@@ -1124,15 +1332,24 @@ def setup_natural_hdr_lighting(hdr_files, bg_image_path=None):
     }
 
 def _get_light(name: str):
+    """
+    Get the light object by name.
+    """
     return bpy.data.objects.get(name) if name else None
 
 def _get_world_mapping_node(name: str):
+    """
+    Get the world mapping node by name.
+    """
     try:
         return bpy.context.scene.world.node_tree.nodes.get(name)
     except Exception:
         return None
 
 def _jitter_lighting(rig, mul_low=0.95, mul_high=1.05):
+    """
+    Slightly jitter the lighting intensities.
+    """
     key  = _get_light(rig.get("key_name"))
     fill = _get_light(rig.get("fill_name"))
     rim  = _get_light(rig.get("rim_name"))
@@ -1144,6 +1361,9 @@ def _jitter_lighting(rig, mul_low=0.95, mul_high=1.05):
     rim.data.energy  = key.data.energy * 0.06
 
 def _rotate_hdri_randomly(rig, lo=-0.25, hi=0.25):
+    """
+    Slightly rotate the HDRI environment map around Z axis.
+    """
     node = _get_world_mapping_node(rig.get("map_node_name"))
     if node is None:
         return
@@ -1170,7 +1390,7 @@ def main():
     if args.seed is not None:
         random.seed(args.seed)
         np.random.seed(args.seed)
-        print(f"🔒 Deterministic run with seed={args.seed}")
+        print(f"Deterministic run with seed={args.seed}")
 
     # Collect HDRs
     hdr_files = []

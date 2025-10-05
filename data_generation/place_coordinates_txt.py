@@ -46,7 +46,7 @@ for split in splits:
         img_path = os.path.join(image_dir, filename)
         label_path = os.path.join(label_dir, f"{name}.txt")
         if not os.path.exists(label_path):
-            print(f"❌ Missing label: {label_path}")
+            print(f"Missing label: {label_path}")
             continue
 
         # Load image
@@ -58,7 +58,7 @@ for split in splits:
             for line in f:
                 parts = line.strip().split()
                 if len(parts) < 2 + len(ALL_KEYPOINTS) * 3:
-                    print(f"⚠️ Skipping malformed line in {label_path}")
+                    print(f"Skipping malformed line in {label_path}")
                     continue
 
                 class_id = int(parts[0])

@@ -1,630 +1,3 @@
-# #!/usr/bin/env python3
-# # -*- coding: utf-8 -*-
-
-# """
-# train.py — YOLO-SEG training (25 classes) + robust NH/T keypoint derivation
-
-# - Trains segmentation on your 25-class YAML (NH*.obj, T*.obj)
-# - After training, runs robust, letterbox-safe inference to derive polygons
-# - Converts polygons -> class-aware keypoints (NH=6, T=5) using PCA geometry
-# - Saves per-image JSON visualizations
-# - (Optional) also writes padded 7-kpt YOLO-Pose labels (NH/T = 2 classes):
-#     ORDER7 = ["tip_right","tip_left","shaft_right","shaft_left","ring_right","ring_left","base"]
-#     - NH: base padded (v=0)
-#     - T : ring_right, ring_left padded (v=0)
-
-# Defaults use your paths:
-#   data=/home/student/project/output/yolo_data_seg/data.yaml
-#   project=seg_phaseB, name=yolo11s_seg_or_aug_2super
-# """
-
-# import argparse
-# import json
-# import os
-# import random
-# import shutil
-# from pathlib import Path
-# from typing import Dict, List, Optional, Tuple
-
-# import cv2
-# import numpy as np
-# from PIL import Image, ImageDraw, ImageFont
-# from ultralytics import YOLO
-
-# # ---------------- Repro (helpful while debugging) ----------------
-# def set_seed_all(seed=0):
-#     try:
-#         import torch
-#         torch.manual_seed(seed)
-#         torch.cuda.manual_seed_all(seed)
-#         torch.backends.cudnn.deterministic = True
-#         torch.backends.cudnn.benchmark = False
-#     except Exception:
-#         pass
-#     random.seed(seed)
-#     np.random.seed(seed)
-
-# # ---------------- NH/T collapse ----------------
-# def kind_from_name(name: str) -> str:
-#     n = (name or "").lower()
-#     return "NH" if n.startswith("nh") else "T"
-
-# # ---------------- Geometry helpers ----------------
-# def _pca_axes(P: np.ndarray):
-#     mean = P.mean(0)
-#     A = P - mean
-#     C = np.cov(A.T)
-#     evals, evecs = np.linalg.eigh(C)
-#     major = evecs[:, int(np.argmax(evals))]
-#     minor = evecs[:, int(np.argmin(evals))]
-#     major /= (np.linalg.norm(major) + 1e-9)
-#     minor /= (np.linalg.norm(minor) + 1e-9)
-#     s = A @ major
-#     return mean, major, minor, float(s.max() - s.min()), s
-
-# def _thickness(pts: np.ndarray, axis: np.ndarray) -> float:
-#     if len(pts) == 0:
-#         return 0.0
-#     d = (pts - pts.mean(0)) @ axis
-#     return float(np.sqrt((d**2).mean() + 1e-12))
-
-# def _farthest_from_shaft(pts: np.ndarray, base: np.ndarray, shaft: np.ndarray) -> np.ndarray:
-#     if len(pts) == 0:
-#         return base.copy()
-#     t = (pts - base) @ shaft
-#     proj = base + np.outer(t, shaft)
-#     d2 = ((pts - proj) ** 2).sum(1)
-#     return pts[int(np.argmax(d2))].copy()
-
-# def _clamp_xy(p, W, H):
-#     return [float(np.clip(p[0], 0, W - 1)), float(np.clip(p[1], 0, H - 1))]
-
-# # ---------------- Class-aware 7-kp extractor (NH=6, T=5) ----------------
-# def keypoints_from_points(P: np.ndarray, img_h: int, img_w: int, kind: str, min_pts: int = 12) -> Optional[Dict[str, List[float]]]:
-#     if P is None or len(P) < min_pts:
-#         return None
-
-#     mean, shaft, side, _, s_all = _pca_axes(P)
-#     smin, smax = float(s_all.min()), float(s_all.max())
-#     span = smax - smin
-#     slab = max(4.0, 0.10 * span)
-#     near_min = P[s_all <= smin + slab]
-#     near_max = P[s_all >= smax - slab]
-#     t_min = _thickness(near_min, side)
-#     t_max = _thickness(near_max, side)
-
-#     if t_max >= t_min:
-#         base = near_max.mean(0) if len(near_max) else P[np.argmax(s_all)]
-#         tip  = near_min.mean(0) if len(near_min) else P[np.argmin(s_all)]
-#         base_t, tip_t = smax, smin
-#     else:
-#         base = near_min.mean(0) if len(near_min) else P[np.argmin(s_all)]
-#         tip  = near_max.mean(0) if len(near_max) else P[np.argmax(s_all)]
-#         base_t, tip_t = smin, smax
-
-#     off_px = 0.02 * max(img_h, img_w)
-#     shaft_left  = mean - off_px * side
-#     shaft_right = mean + off_px * side
-#     tip_split = 0.01 * max(img_h, img_w)
-#     tip_left  = tip - tip_split * side
-#     tip_right = tip + tip_split * side
-
-#     # ring slab near base
-#     start, end = (base_t, base_t + 0.35 * span) if base_t <= (smin + smax)/2 else (base_t - 0.35 * span, base_t)
-#     lo, hi = min(start, end), max(start, end)
-#     mask = (s_all >= lo) & (s_all <= hi)
-#     slab_pts = P[mask] if int(mask.sum()) >= 25 else P
-
-#     if kind == "NH":
-#         side_sign = (slab_pts - slab_pts.mean(0)) @ side
-#         left_pts  = slab_pts[side_sign < 0]
-#         right_pts = slab_pts[side_sign >= 0]
-#         ring_left  = _farthest_from_shaft(left_pts,  base, shaft)
-#         ring_right = _farthest_from_shaft(right_pts, base, shaft)
-#     else:  # Tweezers: synth rings for schema stability (not used by layout; we pad when writing pose)
-#         shaft_dir  = shaft if base_t > tip_t else -shaft  # from tip -> base
-#         anchor     = base + shaft_dir * (0.06 * span)
-#         side_d     = 0.025 * max(img_h, img_w)
-#         ring_right = anchor + side * side_d
-#         ring_left  = anchor - side * side_d
-
-#     return {
-#         "tip_right":   _clamp_xy(tip_right,   img_w, img_h),
-#         "tip_left":    _clamp_xy(tip_left,    img_w, img_h),
-#         "shaft_right": _clamp_xy(shaft_right, img_w, img_h),
-#         "shaft_left":  _clamp_xy(shaft_left,  img_w, img_h),
-#         "ring_right":  _clamp_xy(ring_right,  img_w, img_h),
-#         "ring_left":   _clamp_xy(ring_left,   img_w, img_h),
-#         "base":        _clamp_xy(base,        img_w, img_h),
-#     }
-
-# # ---------------- Robust extraction (letterbox/version safe) ----------------
-# def _poly_in_frame(res, i_det: int, W0: int, H0: int) -> Optional[np.ndarray]:
-#     # 1) normalized polygons
-#     try:
-#         xyn = res.masks.xyn[i_det]
-#         parts = xyn if isinstance(xyn, list) else [xyn]
-#         pts_list = []
-#         for p in parts:
-#             if p is None or len(p) < 3: continue
-#             p = np.asarray(p, dtype=np.float32)
-#             pts_list.append(np.column_stack((p[:, 0] * W0, p[:, 1] * H0)))
-#         if pts_list:
-#             return np.concatenate(pts_list, axis=0)
-#     except Exception:
-#         pass
-#     # 2) absolute polygons (proc) -> scale to frame
-#     try:
-#         xy = res.masks.xy[i_det]
-#         parts = xy if isinstance(xy, list) else [xy]
-#         Hs, Ws = res.orig_shape
-#         sx, sy = W0 / float(Ws), H0 / float(Hs)
-#         pts_list = []
-#         for p in parts:
-#             if p is None or len(p) < 3: continue
-#             p = np.asarray(p, dtype=np.float32)
-#             p[:, 0] *= sx; p[:, 1] *= sy
-#             pts_list.append(p)
-#         if pts_list:
-#             return np.concatenate(pts_list, axis=0)
-#     except Exception:
-#         pass
-#     # 3) bitmap fallback
-#     try:
-#         m = res.masks.data[i_det].cpu().numpy().astype(np.uint8)
-#         cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-#         if not cnts: return None
-#         cnt = max(cnts, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
-#         Hs, Ws = res.orig_shape
-#         sx, sy = W0 / float(Ws), H0 / float(Hs)
-#         cnt[:, 0] *= sx; cnt[:, 1] *= sy
-#         return cnt
-#     except Exception:
-#         return None
-
-# def _box_in_frame(res, i_det: int, W0: int, H0: int) -> List[float]:
-#     # 1) normalized
-#     try:
-#         x1n, y1n, x2n, y2n = res.boxes.xyxyn[i_det]
-#         return [float(x1n * W0), float(y1n * H0), float(x2n * W0), float(y2n * H0)]
-#     except Exception:
-#         pass
-#     # 2) absolute (proc) -> scale to frame
-#     x1, y1, x2, y2 = res.boxes.xyxy[i_det].cpu().numpy().astype(float)
-#     Hs, Ws = res.orig_shape
-#     sx, sy = W0 / float(Ws), H0 / float(Hs)
-#     return [x1 * sx, y1 * sy, x2 * sx, y2 * sy]
-
-# # ---------------- Visual helpers ----------------
-# def draw_points_preview(pil_img: Image.Image, kps: dict, color=(0, 170, 255)):
-#     d = ImageDraw.Draw(pil_img)
-#     r = 4
-#     order = ["tip_right", "tip_left", "shaft_right", "shaft_left", "ring_right", "ring_left", "base"]
-#     for k in order:
-#         x, y = kps[k]
-#         d.ellipse([x - r, y - r, x + r, y + r], outline=color, width=2)
-#     # simple lines
-#     for a, b in [("tip_right", "tip_left"), ("shaft_right", "shaft_left"), ("ring_right", "ring_left"), ("base", "tip_right")]:
-#         x1, y1 = kps[a]
-#         x2, y2 = kps[b]
-#         d.line([x1, y1, x2, y2], fill=color, width=2)
-#     return pil_img
-
-# # ---------------- OR augmentations (callback) ----------------
-# def _rp(p): return random.random() < p
-
-# def add_motion_blur(img, max_ks=21):
-#     k = random.randrange(3, max_ks | 1, 2)
-#     angle = random.uniform(0, 180)
-#     kernel = np.zeros((k, k), np.float32)
-#     kernel[k // 2, :] = 1.0
-#     M = cv2.getRotationMatrix2D((k / 2, k / 2), angle, 1)
-#     kernel = cv2.warpAffine(kernel, M, (k, k))
-#     kernel /= kernel.sum() + 1e-8
-#     return cv2.filter2D(img, -1, kernel)
-
-# def add_gaussian_blur(img, max_ks=9):
-#     k = random.randrange(3, max_ks | 1, 2)
-#     return cv2.GaussianBlur(img, (k, k), 0)
-
-# def add_defocus(img, radius_max=6):
-#     k = random.randint(3, radius_max * 2 + 1) | 1
-#     kernel = np.zeros((k, k), np.float32)
-#     cv2.circle(kernel, (k // 2, k // 2), k // 2, 1, -1)
-#     kernel /= kernel.sum() + 1e-8
-#     return cv2.filter2D(img, -1, kernel)
-
-# def add_jpeg(img, q_low=38, q_high=80):
-#     _, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), random.randint(q_low, q_high)])
-#     return cv2.imdecode(buf, cv2.IMREAD_COLOR)
-
-# def add_vignette(img, strength=0.35):
-#     h, w = img.shape[:2]
-#     xv, yv = np.meshgrid(np.linspace(-1, 1, w), np.linspace(-1, 1, h))
-#     d = np.sqrt(xv ** 2 + yv ** 2)
-#     mask = 1 - np.clip(d, 0, 1) ** 2
-#     mask = (1 - strength) + strength * mask
-#     return (img.astype(np.float32) * mask[..., None]).clip(0, 255).astype(np.uint8)
-
-# def add_color_cast(img, tint=(0, -5, -10), var=12):
-#     b, g, r = cv2.split(img.astype(np.int16))
-#     b = np.clip(b + (tint[0] + random.randint(-var, var)), 0, 255)
-#     g = np.clip(g + (tint[1] + random.randint(-var, var)), 0, 255)
-#     r = np.clip(r + (tint[2] + random.randint(-var, var)), 0, 255)
-#     return cv2.merge([b.astype(np.uint8), g.astype(np.uint8), r.astype(np.uint8)])
-
-# def add_gamma(img, g_low=0.7, g_high=1.4):
-#     gamma = random.uniform(g_low, g_high)
-#     inv = 1.0 / gamma
-#     table = (np.linspace(0, 1, 256) ** inv * 255).astype(np.uint8)
-#     return cv2.LUT(img, table)
-
-# def add_speckle(img, sigma=8):
-#     n = np.random.randn(*img.shape).astype(np.float32) * sigma
-#     return np.clip(img.astype(np.float32) + n, 0, 255).astype(np.uint8)
-
-# def add_specular_glare(img, blobs=1):
-#     h, w = img.shape[:2]
-#     out = img.copy().astype(np.float32)
-#     for _ in range(random.randint(0, blobs)):
-#         x = random.randint(0, w - 1); y = random.randint(0, h - 1)
-#         r = random.randint(int(0.02 * min(h, w)), int(0.08 * min(h, w)))
-#         overlay = np.zeros((h, w), np.float32)
-#         cv2.circle(overlay, (x, y), r, 1.0, -1)
-#         overlay = cv2.GaussianBlur(overlay, (0, 0), r * 0.6)
-#         for c in range(3):
-#             out[..., c] = np.clip(out[..., c] + overlay * random.uniform(90, 140), 0, 255)
-#     return out.astype(np.uint8)
-
-# def add_random_occluder(img):
-#     h, w = img.shape[:2]
-#     out = img.copy()
-#     for _ in range(random.randint(0, 2)):
-#         rw = random.randint(int(0.05 * w), int(0.18 * w))
-#         rh = random.randint(int(0.05 * h), int(0.18 * h))
-#         x1 = random.randint(0, max(0, w - rw - 1))
-#         y1 = random.randint(0, max(0, h - rh - 1))
-#         color = tuple(int(c) for c in np.random.randint(160, 220, size=3))
-#         cv2.rectangle(out, (x1, y1), (x1 + rw, y1 + rh), color, -1)
-#         out = add_jpeg(out, 60, 85)
-#     return out
-
-# def or_augment_image_bgr(img_bgr, strength=1.0):
-#     p = lambda x: x * strength
-#     ops = [
-#     ("cast", p(0.55)), ("gamma", p(0.40)), ("motion", p(0.20)), ("defocus", p(0.15)),
-#     ("gauss", p(0.12)), ("glare", p(0.25)), ("occ", p(0.22)), ("speckle", p(0.28)),
-#     ("vignette", p(0.30)), ("jpeg", p(0.35)),
-#     ]
-#     img = img_bgr.copy()
-#     for name, prob in ops:
-#         if _rp(prob):
-#             if name == "motion": img = add_motion_blur(img)
-#             elif name == "defocus": img = add_defocus(img)
-#             elif name == "gauss": img = add_gaussian_blur(img)
-#             elif name == "gamma": img = add_gamma(img)
-#             elif name == "cast": img = add_color_cast(img)
-#             elif name == "vignette": img = add_vignette(img, strength=random.uniform(0.2, 0.45))
-#             elif name == "speckle": img = add_speckle(img, sigma=random.uniform(4, 10))
-#             elif name == "glare": img = add_specular_glare(img, blobs=1)
-#             elif name == "occ": img = add_random_occluder(img)
-#             elif name == "jpeg": img = add_jpeg(img, q_low=38, q_high=80)
-#     return img
-
-# # ---- Aug callback (works across Ultralytics hook signatures) ----
-# def _extract_batch(*args, **kwargs):
-#     if not args:
-#         return None, None
-#     trainer = args[0]
-#     if len(args) >= 2:
-#         return trainer, args[1]
-#     return trainer, getattr(trainer, "batch", None)
-
-# def make_or_aug_callbacks(state, debug_dir: Optional[Path] = None):
-#     if debug_dir:
-#         debug_dir.mkdir(parents=True, exist_ok=True)
-
-#     def on_train_epoch_start(trainer):
-#         e = trainer.epoch
-#         ramp_len = max(1, int(0.4 * state["epochs"]))
-#         frac = 0.0 if e < state["warmup_epochs"] else min(1.0, (e - state["warmup_epochs"]) / ramp_len)
-#         state["strength"] = state["base_strength"] + (state["max_strength"] - state["base_strength"]) * frac
-#         # reset per-epoch debug/snapshot flag
-#         setattr(trainer, "_or_dbg_done", False)
-        
-#     def or_aug_callback(*args, **kwargs):
-#         tr, batch = _extract_batch(*args, **kwargs)
-#         if batch is None or "img" not in batch or batch.get("_or_aug_done", False):
-#             return
-#         try:
-#             import torch
-#             imgs = batch["img"]
-#             with torch.no_grad():
-#                 arr = (imgs.clamp(0,1).cpu().numpy()*255).astype(np.uint8)
-#                 out = np.empty_like(arr)
-#                 for i in range(arr.shape[0]):
-#                     rgb = np.transpose(arr[i], (1,2,0))
-#                     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-#                     bgr = or_augment_image_bgr(bgr, strength=state["strength"])
-#                     rgb2 = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-#                     out[i] = np.transpose(rgb2, (2,0,1))
-#                 batch["img"] = torch.from_numpy(out.astype(np.float32)/255.0).to(imgs.device)
-#                 batch["_or_aug_done"] = True
-
-#                 # --- optional debug snapshot once per epoch ---
-#                 if debug_dir and not getattr(tr, "_or_dbg_done", False):
-#                     out_path = debug_dir / f"or_aug_e{tr.epoch:03d}.png"
-#                     grid = np.concatenate(
-#                         [np.transpose(out[j], (1,2,0)) for j in range(min(8, out.shape[0]))],
-#                         axis=1
-#                     )
-#                     Image.fromarray(grid).save(out_path)
-#                     tr._or_dbg_done = True
-
-#         except Exception:
-#             return
-
-#     return on_train_epoch_start, or_aug_callback
-
-# # ---------------- Pose label writer (padded 7-kpt) ----------------
-# ORDER7 = ["tip_right", "tip_left", "shaft_right", "shaft_left", "ring_right", "ring_left", "base"]
-
-# def _norm_xywh(xyxy, W, H):
-#     x1, y1, x2, y2 = map(float, xyxy)
-#     w = max(1e-6, x2 - x1); h = max(1e-6, y2 - y1)
-#     cx = (x1 + x2) * 0.5; cy = (y1 + y2) * 0.5
-#     return cx / W, cy / H, w / W, h / H
-
-# def pose_line_padded(kind: str, xyxy, kps: Dict[str, List[float]], W: int, H: int) -> str:
-#     cls01 = 0 if kind == "NH" else 1
-#     cx, cy, w, h = _norm_xywh(xyxy, W, H)
-#     parts = [str(cls01), f"{cx:.6f}", f"{cy:.6f}", f"{w:.6f}", f"{h:.6f}"]
-#     for name in ORDER7:
-#         if (kind == "T" and name in ("ring_right", "ring_left")) or (kind == "NH" and name == "base"):
-#             xn, yn, v = 0.0, 0.0, 0
-#         else:
-#             x_pix, y_pix = kps[name]
-#             v = 2 if (0 <= x_pix <= W - 1 and 0 <= y_pix <= H - 1) else 1
-#             xn = float(np.clip(x_pix / W, 0.0, 1.0))
-#             yn = float(np.clip(y_pix / H, 0.0, 1.0))
-#         parts.extend([f"{xn:.6f}", f"{yn:.6f}", str(v)])
-#     return " ".join(parts)
-
-# # ---------------- Derivation (multi-scale + conf ladder) ----------------
-# def list_images(dir_path: Path) -> List[Path]:
-#     exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
-#     return sorted([p for p in dir_path.rglob("*") if p.suffix.lower() in exts])
-
-# def predict_best(model: YOLO, frame_bgr: np.ndarray, scales: Tuple[float, ...], confs: Tuple[float, ...],
-#                  imgsz: int, iou: float, device: str):
-#     best = None
-#     for s in scales:
-#         proc = frame_bgr if abs(s - 1.0) < 1e-6 else cv2.resize(frame_bgr, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
-#         for c in confs:
-#             res = model.predict(source=proc, imgsz=imgsz, conf=c, iou=iou,
-#                                 device=device, verbose=False, retina_masks=True, agnostic_nms=False)[0]
-#             if res.masks is not None and len(res.masks) > 0:
-#                 return res, s, c
-#     return best
-
-# def derive_for_split(model: YOLO, split_dir: Path, names_map: Dict[int, str], out_root: Path,
-#                      imgsz: int, iou: float, device: str,
-#                      scales: Tuple[float, ...], confs: Tuple[float, ...],
-#                      write_pose: bool, pose_out: Optional[Path], pose_copy_images: bool):
-
-#     json_dir = out_root / "json"; json_dir.mkdir(parents=True, exist_ok=True)
-#     vis_dir  = out_root / "vis";  vis_dir.mkdir(parents=True, exist_ok=True)
-#     font = ImageFont.load_default()
-
-#     # If writing pose dataset, prepare dirs mirroring this split
-#     if write_pose and pose_out is not None:
-#         (pose_out / "images").mkdir(parents=True, exist_ok=True)
-#         (pose_out / "labels").mkdir(parents=True, exist_ok=True)
-
-#     img_files = list_images(split_dir)
-#     for img_path in img_files:
-#         frame = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
-#         if frame is None:
-#             continue
-#         H0, W0 = frame.shape[:2]
-#         best = predict_best(model, frame, scales, confs, imgsz, iou, device)
-#         items = []
-#         if best is not None:
-#             res, used_scale, used_conf = best
-#             cls = res.boxes.cls.cpu().numpy().astype(int)
-#             for i_det, raw_idx in enumerate(cls):
-#                 raw_name = names_map.get(int(raw_idx), str(raw_idx))
-#                 kind = kind_from_name(raw_name)  # "NH" / "T"
-
-#                 poly = _poly_in_frame(res, i_det, W0, H0)
-#                 if poly is None or len(poly) < 3:
-#                     continue
-#                 xyxy = _box_in_frame(res, i_det, W0, H0)
-
-#                 kps = keypoints_from_points(poly, H0, W0, kind, min_pts=12)
-#                 if kps is None:
-#                     continue
-
-#                 items.append({"kind": kind, "xyxy": xyxy, "kps": kps})
-
-#         # Save JSON + VIS
-#         img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-#         out_list = []
-#         for it in items:
-#             out_list.append({
-#                 "kind": it["kind"],
-#                 "keypoints": {k: [float(x), float(y), 2] for k, (x, y) in it["kps"].items()}
-#             })
-#             draw_points_preview(img_pil, it["kps"], color=(0, 170, 255))
-#             # small label near base if exists
-#             bx, by = it["kps"]["base"]
-#             d = ImageDraw.Draw(img_pil)
-#             try:
-#                 bb = d.textbbox((bx, by), it["kind"], font=font)
-#                 d.rectangle(bb, fill=(0, 0, 0, 128))
-#             except Exception:
-#                 pass
-#             d.text((bx, by), it["kind"], fill=(255, 255, 255), font=font)
-
-#         stem = img_path.stem
-#         (json_dir / f"{stem}.json").write_text(json.dumps(out_list, indent=2))
-#         img_pil.save(vis_dir / f"{stem}.png", "PNG", optimize=True)
-
-#         # Optional: write padded 7-kpt YOLO-Pose labels + copy image
-#         if write_pose and pose_out is not None:
-#             # Decide split subdirs based on original path (train/val)
-#             if "train" in str(split_dir):
-#                 split_sub = "train"
-#             elif "val" in str(split_dir):
-#                 split_sub = "val"
-#             else:
-#                 split_sub = "extra"
-
-#             img_dst_dir = pose_out / "images" / split_sub
-#             lab_dst_dir = pose_out / "labels" / split_sub
-#             img_dst_dir.mkdir(parents=True, exist_ok=True)
-#             lab_dst_dir.mkdir(parents=True, exist_ok=True)
-
-#             # copy image if requested
-#             dst_img = img_dst_dir / (stem + img_path.suffix.lower())
-#             if pose_copy_images:
-#                 if not dst_img.exists():
-#                     shutil.copy2(img_path, dst_img)
-#             else:
-#                 # ensure at least something exists; create a symlink if OS supports
-#                 try:
-#                     if dst_img.exists():
-#                         dst_img.unlink()
-#                     os.symlink(img_path, dst_img)
-#                 except Exception:
-#                     if not dst_img.exists():
-#                         shutil.copy2(img_path, dst_img)
-
-#             # write label
-#             lab_path = lab_dst_dir / f"{stem}.txt"
-#             lines = []
-#             for it in items:
-#                 lines.append(pose_line_padded(it["kind"], it["xyxy"], it["kps"], W0, H0))
-#             with open(lab_path, "w") as f:
-#                 f.write("\n".join(lines))
-
-# # ---------------- Main ----------------
-# def main():
-#     ap = argparse.ArgumentParser()
-#     # SEG training
-#     ap.add_argument("--data",   default="/home/student/project/output/yolo_data_seg/data.yaml")
-#     ap.add_argument("--model",  default="yolo11s-seg.pt")
-#     ap.add_argument("--epochs", type=int, default=40)
-#     ap.add_argument("--imgsz",  type=int, default=1280)
-#     ap.add_argument("--batch",  type=int, default=-1)
-#     ap.add_argument("--device", default="0")
-#     ap.add_argument("--project", default="seg_phaseB")
-#     ap.add_argument("--name",    default="yolo11s_seg_or_aug_2super")
-
-#     # Derivation config
-#     ap.add_argument("--derive_on", choices=["none", "val", "train", "both"], default="val")
-#     ap.add_argument("--derive_imgsz", type=int, default=1536)
-#     ap.add_argument("--derive_iou",  type=float, default=0.55)
-#     ap.add_argument("--scales", type=str, default="1.25,1.0")
-#     ap.add_argument("--conf_ladder", type=str, default="0.36,0.32,0.28")
-
-#     # Pose dataset writing (optional)
-#     ap.add_argument("--write_pose", action="store_true")
-#     ap.add_argument("--pose_out", type=str, default="/home/student/project/output/yolo_data")
-#     ap.add_argument("--pose_copy_images", action="store_true")
-
-#     # OR aug curriculum
-#     ap.add_argument("--warmup_epochs", type=int, default=5)
-#     ap.add_argument("--base_strength", type=float, default=0.6)
-#     ap.add_argument("--max_strength",  type=float, default=1.15)
-
-#     args = ap.parse_args()
-#     set_seed_all(0)
-
-#     # ---- Train SEG (25 classes) ----
-#     model = YOLO(args.model)
-
-#     state = {
-#         "epochs": args.epochs,
-#         "warmup_epochs": args.warmup_epochs,
-#         "base_strength": args.base_strength,
-#         "max_strength": args.max_strength,
-#         "strength": args.base_strength,
-#     }
-#     on_epoch_start, or_aug_cb = make_or_aug_callbacks(state, debug_dir=Path("/home/student/project/debug_or_aug"))
-#     model.add_callback("on_train_epoch_start", on_epoch_start)
-#     # register across multiple hooks; guard prevents double application
-#     for hook in ("on_preprocess_batch_end", "on_preprocess_end", "on_train_batch_start"):
-#         model.add_callback(hook, or_aug_cb)
-
-#     model.train(
-#         data=args.data,
-#         epochs=args.epochs,
-#         imgsz=args.imgsz,
-#         batch=args.batch,
-#         device=args.device,
-#         project=args.project,
-#         name=args.name,
-#         pretrained=True,
-#         amp=True,
-        
-#         optimizer="AdamW",
-#         lr0=0.0014,
-#         weight_decay=0.01,
-#         cos_lr=True,
-#         warmup_epochs=3,
-#         patience=10,
-
-#         mosaic=0.01, mixup=0.00, close_mosaic=max(8, args.epochs // 12),
-#         # copy_paste=0.15,
-#         degrees=5.0, translate=0.03, scale=0.12, shear=0.25, perspective=0.0008,
-#         fliplr=0.2, flipud=0.0,  # keep L/R semantics stable
-#         hsv_h=0.010, hsv_s=0.28, hsv_v=0.28,
-#         erasing=0.18,
-
-#         workers=8, cache=True
-#     )
-
-#     # ---- Reload best and derive KPs ----
-#     best = Path(model.trainer.save_dir) / "weights" / "best.pt"
-#     seg = YOLO(str(best))
-#     raw_names = seg.model.names
-#     names_map = {int(k): v for k, v in raw_names.items()} if isinstance(raw_names, dict) else {i: n for i, n in enumerate(raw_names)}
-#     assert all(str(v).lower().startswith(("nh", "t")) for v in names_map.values()), f"Unexpected class names in seg YAML: {names_map}"
-
-#     save_root = Path(model.trainer.save_dir) / "derived_kpts"
-#     ds_root = Path(args.data).parent
-#     imgs_train = ds_root / "images" / "train"
-#     imgs_val   = ds_root / "images" / "val"
-
-#     scales = tuple(float(s.strip()) for s in args.scales.split(",") if s.strip())
-#     confs  = tuple(float(s.strip()) for s in args.conf_ladder.split(",") if s.strip())
-
-#     if args.derive_on in ("train", "both") and imgs_train.exists():
-#         derive_for_split(seg, imgs_train, names_map, save_root / "train",
-#                          imgsz=args.derive_imgsz, iou=args.derive_iou, device=args.device,
-#                          scales=scales, confs=confs,
-#                          write_pose=args.write_pose,
-#                          pose_out=Path(args.pose_out), pose_copy_images=args.pose_copy_images)
-
-#     if args.derive_on in ("val", "both") and imgs_val.exists():
-#         derive_for_split(seg, imgs_val, names_map, save_root / "val",
-#                          imgsz=args.derive_imgsz, iou=args.derive_iou, device=args.device,
-#                          scales=scales, confs=confs,
-#                          write_pose=args.write_pose,
-#                          pose_out=Path(args.pose_out), pose_copy_images=args.pose_copy_images)
-
-#     print("\n✅ Done.")
-#     print(f"  Weights:     {best}")
-#     if (save_root / "val").exists() or (save_root / "train").exists():
-#         print(f"  Derived KPs: {save_root}")
-#     if args.write_pose:
-#         print(f"  Pose data →  {args.pose_out} (images/ & labels/ with padded 7-kpt)")
-        
-
-# if __name__ == "__main__":
-#     main()
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -810,6 +183,20 @@ def or_augment_image_bgr(img_bgr, strength=1.0):
 
 # one safe hook with an internal guard
 def make_train_callbacks(state, use_clahe=True, clahe_clip=2.0):
+    """
+    Create two YOLOv8 training callbacks:
+    - on_train_epoch_start(tr): adjust OR aug strength over epochs
+    - on_preprocess_end(tr): apply CLAHE + OR aug to batch images
+    state: dict with keys:
+        "epochs": int, total epochs
+        "warmup_epochs": int, epochs with no OR aug
+        "base_strength": float, initial OR aug strength
+        "max_strength": float, final OR aug strength
+        "strength": float, current OR aug strength (updated each epoch)
+    use_clahe: bool, whether to apply CLAHE before OR aug
+    clahe_clip: float, CLAHE clip limit
+    Returns: (on_train_epoch_start, on_preprocess_end) callbacks
+    """
     def on_train_epoch_start(tr):
         e = getattr(tr, "epoch", 0)
         ramp = max(1, int(0.4 * state["epochs"]))
@@ -960,6 +347,10 @@ def keypoints_from_points(P: np.ndarray, img_h: int, img_w: int, kind: str, min_
 # Result → polys/boxes (frame coords; letterbox-safe)
 # ==========================
 def poly_in_frame(res, i_det: int, W0: int, H0: int) -> Optional[np.ndarray]:
+    """
+    Extract polygon for detection i_det from results res, scaled to W0 x H0 frame.
+    Returns Nx2 float32 array or None if no polygon found.
+    """
     # prefer normalized polygons if available
     try:
         parts = res.masks.xyn[i_det]; parts = parts if isinstance(parts, list) else [parts]
@@ -984,6 +375,10 @@ def poly_in_frame(res, i_det: int, W0: int, H0: int) -> Optional[np.ndarray]:
         return None
 
 def box_in_frame(res, i_det: int, W0: int, H0: int) -> List[float]:
+    """
+    Extract bounding box for detection i_det from results res, scaled to W0 x H0 frame. 
+    Returns [x1,y1,x2,y2] as floats.
+    """
     try:
         x1n, y1n, x2n, y2n = res.boxes.xyxyn[i_det]
         return [float(x1n*W0), float(y1n*H0), float(x2n*W0), float(y2n*H0)]
@@ -997,6 +392,10 @@ def box_in_frame(res, i_det: int, W0: int, H0: int) -> List[float]:
 # Post-train derivation helpers
 # ==========================
 def iou_xyxy(a, b):
+    """
+    IoU of two [x1,y1,x2,y2] boxes.
+    0.0 if no overlap or invalid boxes.
+    """
     ax1,ay1,ax2,ay2 = a; bx1,by1,bx2,by2 = b
     iw = max(0.0, min(ax2,bx2)-max(ax1,bx1))
     ih = max(0.0, min(ay2,by2)-max(ay1,by1))
@@ -1004,6 +403,11 @@ def iou_xyxy(a, b):
     return inter/ua if ua>0 else 0.0
 
 def nms_union(items, iou_thr=0.6):
+    """
+    Non-maximum suppression in frame space (boxes).
+    items: list of dict with keys "cls", "conf", "poly", "xyxy"
+    Returns: filtered list of items
+    """
     keep = []
     items = sorted(items, key=lambda x: x["conf"], reverse=True)
     for it in items:
@@ -1012,17 +416,33 @@ def nms_union(items, iou_thr=0.6):
     return keep
 
 def list_images(dir_path: Path) -> List[Path]:
+    """
+    Recursively list all image files in dir_path.
+    Returns sorted list of Paths.
+    """
     exts = (".jpg",".jpeg",".png",".bmp",".tif",".tiff")
     return sorted([p for p in dir_path.rglob("*") if p.suffix.lower() in exts])
 
 ORDER7 = ["tip_right","tip_left","shaft_right","shaft_left","ring_right","ring_left","base"]
 def _norm_xywh(xyxy, W, H):
+    """
+    Convert [x1,y1,x2,y2] box to normalized [cx,cy,w,h].
+    """
     x1,y1,x2,y2 = map(float, xyxy)
     w=max(1e-6,x2-x1); h=max(1e-6,y2-y1)
     cx=(x1+x2)*0.5; cy=(y1+y2)*0.5
     return cx/W, cy/H, w/W, h/H
 
 def pose_line_padded(kind: str, xyxy, kps: Dict[str,List[float]], W: int, H: int) -> str:
+    """
+    Create a padded YOLO-Pose label line (string) for one object.
+    kind: "NH" or "T"
+    xyxy: [x1,y1,x2,y2] box in frame coords
+    kps: dict of 7 keypoints {name:[x_pix,y_pix]}
+    W, H: image width and height
+    Returns: string line or raises Exception on error.
+    """
+    
     cls01 = 0 if kind=="NH" else 1
     cx,cy,w,h = _norm_xywh(xyxy, W, H)
     parts = [str(cls01), f"{cx:.6f}", f"{cy:.6f}", f"{w:.6f}", f"{h:.6f}"]
@@ -1038,7 +458,10 @@ def pose_line_padded(kind: str, xyxy, kps: Dict[str,List[float]], W: int, H: int
 
 def predict_union(model: YOLO, frame_bgr: np.ndarray, scales: Tuple[float,...], confs: Tuple[float,...],
                   imgsz: int, iou: float, device: str):
-    """Run all scale×conf, map to frame coords, then NMS in frame space."""
+    """
+    Multi-scale, multi-confidence prediction.
+    Returns: list of dict with keys "cls", "conf", "poly", "xyxy"
+    """
     H0, W0 = frame_bgr.shape[:2]
     cands = []
     for s in scales:
@@ -1062,6 +485,11 @@ def derive_for_split(model: YOLO, split_dir: Path, names_map: Dict[int,str], out
                      imgsz: int, iou: float, device: str,
                      scales: Tuple[float,...], confs: Tuple[float,...],
                      write_pose: bool, pose_out: Optional[Path], pose_copy_images: bool):
+    """
+    Derive geometry for all images in split_dir using model.
+    Saves JSON and VIS in out_root/{json,vis}.
+    Optionally saves padded YOLO-Pose labels and images in pose_out.
+    """
 
     json_dir = out_root / "json"; json_dir.mkdir(parents=True, exist_ok=True)
     vis_dir  = out_root / "vis";  vis_dir.mkdir(parents=True, exist_ok=True)
